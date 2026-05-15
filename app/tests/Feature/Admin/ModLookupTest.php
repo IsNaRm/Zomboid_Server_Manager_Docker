@@ -117,3 +117,63 @@ it('requires authentication', function () {
     $this->postJson('/admin/mods/lookup', ['workshop_id' => '111'])
         ->assertStatus(401);
 });
+
+// ── Round-trip: multi-id lookup → modpack POST ────────────────────────
+
+it('round-trips a modpack: lookup returns multiple mod_ids, store accepts them all', function () {
+    Http::fake([
+        'api.steampowered.com/*' => Http::response([
+            'response' => [
+                'publishedfiledetails' => [[
+                    'result' => 1,
+                    'publishedfileid' => '7000000001',
+                    'title' => 'Bundled Pack',
+                    'description' => "Mod ID: PackCore\nMod ID: PackExtras",
+                    'preview_url' => null,
+                ]],
+            ],
+        ]),
+    ]);
+
+    $tempDir = sys_get_temp_dir().'/pz_modlookup_test_'.uniqid();
+    mkdir($tempDir.'/Server', 0777, true);
+    $iniPath = $tempDir.'/Server/ZomboidServer.ini';
+    copy(base_path('tests/fixtures/server.ini'), $iniPath);
+    config(['zomboid.paths.server_ini' => $iniPath]);
+
+    try {
+        $lookup = $this->actingAs($this->admin)
+            ->postJson('/admin/mods/lookup', ['workshop_id' => '7000000001'])
+            ->assertOk()
+            ->json();
+
+        expect($lookup['mod_ids'])->toBe(['PackCore', 'PackExtras']);
+
+        $this->actingAs($this->admin)
+            ->postJson('/admin/mods', [
+                'workshop_id' => '7000000001',
+                'mod_ids' => $lookup['mod_ids'],
+            ])
+            ->assertStatus(201)
+            ->assertJson([
+                'added' => [
+                    'workshop_id' => '7000000001',
+                    'mod_ids' => ['PackCore', 'PackExtras'],
+                ],
+                'restart_required' => true,
+            ]);
+
+        $state = file_get_contents($tempDir.'/Server/.mod_state');
+        expect($state)
+            ->toContain('Mods=SuperSurvivors;Hydrocraft;PackCore;PackExtras;ZomboidManager')
+            ->and($state)->toContain('WorkshopItems=2561774086;2286126274;7000000001;3685323705')
+            ->and($state)->toContain('PackCore:7000000001')
+            ->and($state)->toContain('PackExtras:7000000001');
+    } finally {
+        @unlink($tempDir.'/Server/.mod_state');
+        @unlink($tempDir.'/Server/.mod_state_applied');
+        @unlink($iniPath);
+        @rmdir($tempDir.'/Server');
+        @rmdir($tempDir);
+    }
+});

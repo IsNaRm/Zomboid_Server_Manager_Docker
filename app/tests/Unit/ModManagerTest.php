@@ -106,8 +106,8 @@ it('removes map folder when removing map mod', function () {
     // First add a map mod
     $this->manager->add($this->iniPath, '9999999999', 'MapMod', 'CustomMap');
 
-    // Then remove it with map folder
-    $this->manager->remove($this->iniPath, '9999999999', 'CustomMap');
+    // Then remove it with map folder (mod_id positional after workshop_id)
+    $this->manager->remove($this->iniPath, '9999999999', null, 'CustomMap');
 
     $config = $this->parser->read($this->iniPath);
 
@@ -301,8 +301,12 @@ it('does not duplicate ZomboidManager when reorder already contains it', functio
     ]);
 
     $stateContent = file_get_contents($this->tempDir.'/Server/.mod_state');
-    expect(substr_count($stateContent, 'ZomboidManager'))->toBe(1)
-        ->and(substr_count($stateContent, '3685323705'))->toBe(1);
+
+    // Per-line checks: each list line must contain ZomboidManager exactly once.
+    preg_match('/^Mods=(.*)$/m', $stateContent, $modsLine);
+    preg_match('/^WorkshopItems=(.*)$/m', $stateContent, $workshopLine);
+    expect(substr_count($modsLine[1] ?? '', 'ZomboidManager'))->toBe(1)
+        ->and(substr_count($workshopLine[1] ?? '', '3685323705'))->toBe(1);
 });
 
 it('rolls back the INI when state file write fails', function () {
@@ -392,4 +396,91 @@ it('falls back to active when applied snapshot is missing on running server', fu
         ->and($result['applied_snapshot_present'])->toBeFalse()
         ->and(collect($result['mods'])->pluck('status')->all())
         ->each->toBe('active');
+});
+
+// ── Modpack support (one workshop_id → multiple mod_ids) ──────────────
+
+it('appends multiple mod_ids for one workshop_id without duplicating the workshop entry', function () {
+    $this->manager->add($this->iniPath, '9000000001', ['PackCore', 'PackExtras']);
+
+    $stateContent = file_get_contents($this->tempDir.'/Server/.mod_state');
+    expect($stateContent)
+        ->toContain('Mods=SuperSurvivors;Hydrocraft;PackCore;PackExtras;ZomboidManager')
+        ->and($stateContent)->toContain('WorkshopItems=2561774086;2286126274;9000000001;3685323705')
+        ->and(substr_count($stateContent, '9000000001'))->toBe(3); // Mods=, WorkshopItems=, WorkshopMap=
+});
+
+it('writes a WorkshopMap line tying each mod_id to its source workshop_id', function () {
+    $this->manager->add($this->iniPath, '9000000001', ['PackCore', 'PackExtras']);
+
+    $stateContent = file_get_contents($this->tempDir.'/Server/.mod_state');
+    expect($stateContent)->toContain(
+        'WorkshopMap=SuperSurvivors:2561774086;Hydrocraft:2286126274;PackCore:9000000001;PackExtras:9000000001;ZomboidManager:3685323705'
+    );
+});
+
+it('keeps the workshop_id intact when only one mod of a pack is removed', function () {
+    $this->manager->add($this->iniPath, '9000000001', ['PackCore', 'PackExtras']);
+
+    $removed = $this->manager->remove($this->iniPath, '9000000001', 'PackCore');
+
+    expect($removed)->toBe(['workshop_id' => '9000000001', 'mod_id' => 'PackCore']);
+
+    $stateContent = file_get_contents($this->tempDir.'/Server/.mod_state');
+    expect($stateContent)
+        ->toContain('Mods=SuperSurvivors;Hydrocraft;PackExtras;ZomboidManager')
+        ->and($stateContent)->toContain('WorkshopItems=2561774086;2286126274;9000000001;3685323705')
+        ->and($stateContent)->toContain('PackExtras:9000000001')
+        ->and($stateContent)->not->toContain('PackCore:9000000001');
+});
+
+it('drops the workshop_id once every mod of a pack is removed', function () {
+    $this->manager->add($this->iniPath, '9000000001', ['PackCore', 'PackExtras']);
+
+    $this->manager->remove($this->iniPath, '9000000001', 'PackCore');
+    $this->manager->remove($this->iniPath, '9000000001', 'PackExtras');
+
+    $stateContent = file_get_contents($this->tempDir.'/Server/.mod_state');
+    expect($stateContent)
+        ->not->toContain('PackCore')
+        ->and($stateContent)->not->toContain('PackExtras')
+        ->and($stateContent)->not->toContain('9000000001');
+});
+
+it('falls back to positional pairing for legacy .mod_state without WorkshopMap', function () {
+    file_put_contents(
+        $this->tempDir.'/Server/.mod_state',
+        "Mods=ModA;ModB\nWorkshopItems=1111111111;2222222222\n"
+    );
+
+    $mods = $this->manager->list($this->iniPath);
+
+    expect(collect($mods)->keyBy('mod_id')->toArray())
+        ->toHaveKey('ModA')
+        ->and(collect($mods)->keyBy('mod_id')['ModA']['workshop_id'])->toBe('1111111111')
+        ->and(collect($mods)->keyBy('mod_id')['ModB']['workshop_id'])->toBe('2222222222');
+});
+
+it('rewrites legacy .mod_state with a fresh WorkshopMap on the next write', function () {
+    // Legacy 2-line state file (no WorkshopMap).
+    file_put_contents(
+        $this->tempDir.'/Server/.mod_state',
+        "Mods=ModA;ModB\nWorkshopItems=1111111111;2222222222\n"
+    );
+
+    $this->manager->add($this->iniPath, '3333333333', 'ModC');
+
+    $stateContent = file_get_contents($this->tempDir.'/Server/.mod_state');
+    expect($stateContent)
+        ->toContain('WorkshopMap=')
+        ->and($stateContent)->toContain('ModA:1111111111')
+        ->and($stateContent)->toContain('ModB:2222222222')
+        ->and($stateContent)->toContain('ModC:3333333333');
+});
+
+it('accepts a single mod_id as a string for backwards compatibility', function () {
+    $this->manager->add($this->iniPath, '4444444444', 'LegacyCaller');
+
+    $stateContent = file_get_contents($this->tempDir.'/Server/.mod_state');
+    expect($stateContent)->toContain('Mods=SuperSurvivors;Hydrocraft;LegacyCaller;ZomboidManager');
 });

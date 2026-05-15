@@ -1,20 +1,15 @@
 <?php
 
-namespace App\Http\Requests\Api;
+namespace App\Http\Requests\Admin;
 
 use Illuminate\Foundation\Http\FormRequest;
 
 class AddModRequest extends FormRequest
 {
-    public function authorize(): bool
-    {
-        return true;
-    }
-
     /**
      * Promote legacy singular `mod_id` payloads to the new `mod_ids: []` shape
-     * so the validation rules below can stay strict without breaking older API
-     * consumers (or the UI mid-deploy).
+     * so the validation rules below can stay strict without breaking older
+     * admin-UI builds shipped before the modpack refactor.
      */
     protected function prepareForValidation(): void
     {

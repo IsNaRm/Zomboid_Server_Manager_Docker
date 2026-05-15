@@ -9,6 +9,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Checkbox } from '@/components/ui/checkbox';
 import {
     Dialog,
     DialogContent,
@@ -183,6 +184,7 @@ export default function Mods({
     const [deleteTarget, setDeleteTarget] = useState<ModEntry | null>(null);
     const [workshopId, setWorkshopId] = useState('');
     const [modId, setModId] = useState('');
+    const [selectedModIds, setSelectedModIds] = useState<string[]>([]);
     const [mapFolder, setMapFolder] = useState('');
     const [loading, setLoading] = useState(false);
     const [restarting, setRestarting] = useState(false);
@@ -193,6 +195,9 @@ export default function Mods({
     const lookupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const lookupAbort = useRef<AbortController | null>(null);
 
+    const isMultiSelect =
+        lookup.status === 'success' && lookup.modIds.length > 1 && !manualOverride;
+
     const isFiltering = search.length > 0;
 
     useEffect(() => {
@@ -202,6 +207,7 @@ export default function Mods({
     const resetLookupState = useCallback(() => {
         setLookup({ status: 'idle' });
         setModId('');
+        setSelectedModIds([]);
         setMapFolder('');
         setManualOverride(false);
     }, []);
@@ -253,6 +259,7 @@ export default function Mods({
         if (modIds.length === 0) {
             setLookup({ status: 'no_mod_ids', title, previewUrl, mapFolders });
             setModId('');
+            setSelectedModIds([]);
             setMapFolder(mapFolders[0] ?? '');
             setManualOverride(true);
             return;
@@ -260,6 +267,7 @@ export default function Mods({
 
         setLookup({ status: 'success', title, previewUrl, modIds, mapFolders });
         setModId(modIds[0]);
+        setSelectedModIds(modIds);
         setMapFolder(mapFolders[0] ?? '');
         setManualOverride(false);
     }, []);
@@ -333,10 +341,19 @@ export default function Mods({
     }
 
     async function addMod() {
+        const modIdsToSend = isMultiSelect ? selectedModIds : [modId];
+        const successKey =
+            modIdsToSend.length > 1
+                ? t('admin.mods.toast_added_many', { count: String(modIdsToSend.length) })
+                : t('admin.mods.toast_added', { mod_id: modIdsToSend[0] ?? '' });
         setLoading(true);
         await fetchAction('/admin/mods', {
-            data: { workshop_id: workshopId, mod_id: modId, map_folder: mapFolder || null },
-            successMessage: t('admin.mods.toast_added', { mod_id: modId }),
+            data: {
+                workshop_id: workshopId,
+                mod_ids: modIdsToSend,
+                map_folder: mapFolder || null,
+            },
+            successMessage: successKey,
         });
         setLoading(false);
         closeAddDialog();
@@ -345,10 +362,13 @@ export default function Mods({
 
     async function removeMod(mod: ModEntry) {
         setLoading(true);
-        await fetchAction(`/admin/mods/${mod.workshop_id}`, {
-            method: 'DELETE',
-            successMessage: t('admin.mods.toast_removed', { mod_id: mod.mod_id }),
-        });
+        await fetchAction(
+            `/admin/mods/${mod.workshop_id}?mod_id=${encodeURIComponent(mod.mod_id)}`,
+            {
+                method: 'DELETE',
+                successMessage: t('admin.mods.toast_removed', { mod_id: mod.mod_id }),
+            },
+        );
         setLoading(false);
         setDeleteTarget(null);
         router.reload({ only: ['mods', 'pendingRestart', 'serverRunning'] });
@@ -532,19 +552,67 @@ export default function Mods({
                                     </Button>
                                 )}
                             </div>
-                            {lookup.status === 'success' && lookup.modIds.length > 1 && !manualOverride ? (
-                                <Select value={modId} onValueChange={setModId}>
-                                    <SelectTrigger id="mod-id" data-testid="mod-id-select">
-                                        <SelectValue />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        {lookup.modIds.map((id) => (
-                                            <SelectItem key={id} value={id}>
-                                                {id}
-                                            </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
+                            {isMultiSelect ? (
+                                <div
+                                    className="space-y-2 rounded-md border bg-muted/20 p-3"
+                                    data-testid="mod-id-multi-select"
+                                >
+                                    <p className="text-xs text-muted-foreground">
+                                        {t('admin.mods.modpack_hint')}
+                                    </p>
+                                    <div className="flex flex-wrap gap-2 pb-1">
+                                        <Button
+                                            type="button"
+                                            variant="outline"
+                                            size="sm"
+                                            className="h-7 px-2 text-xs"
+                                            onClick={() =>
+                                                lookup.status === 'success'
+                                                    ? setSelectedModIds(lookup.modIds)
+                                                    : undefined
+                                            }
+                                            data-testid="mod-id-select-all"
+                                        >
+                                            {t('admin.mods.select_all_mod_ids')}
+                                        </Button>
+                                        <Button
+                                            type="button"
+                                            variant="outline"
+                                            size="sm"
+                                            className="h-7 px-2 text-xs"
+                                            onClick={() => setSelectedModIds([])}
+                                            data-testid="mod-id-clear-all"
+                                        >
+                                            {t('admin.mods.clear_selection')}
+                                        </Button>
+                                    </div>
+                                    <div className="space-y-1.5">
+                                        {(lookup.status === 'success' ? lookup.modIds : ([] as string[])).map(
+                                            (id: string) => {
+                                                const checked = selectedModIds.includes(id);
+                                                return (
+                                                    <label
+                                                        key={id}
+                                                        className="flex cursor-pointer items-center gap-2 text-sm"
+                                                    >
+                                                        <Checkbox
+                                                            checked={checked}
+                                                            onCheckedChange={(value: boolean | 'indeterminate') => {
+                                                                setSelectedModIds((prev: string[]) =>
+                                                                    value
+                                                                        ? Array.from(new Set([...prev, id]))
+                                                                        : prev.filter((v: string) => v !== id),
+                                                                );
+                                                            }}
+                                                            data-testid={`mod-id-checkbox-${id}`}
+                                                        />
+                                                        <span className="font-mono text-xs">{id}</span>
+                                                    </label>
+                                                );
+                                            },
+                                        )}
+                                    </div>
+                                </div>
                             ) : (
                                 <Input
                                     id="mod-id"
@@ -558,7 +626,7 @@ export default function Mods({
                                     data-testid="mod-id-input"
                                 />
                             )}
-                            {lookup.status === 'success' && !manualOverride && (
+                            {lookup.status === 'success' && !manualOverride && !isMultiSelect && (
                                 <p className="text-xs text-muted-foreground">
                                     {t('admin.mods.mod_id_auto_filled')}
                                 </p>

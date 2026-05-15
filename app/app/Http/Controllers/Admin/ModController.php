@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
+use App\Http\Requests\Admin\AddModRequest;
 use App\Http\Requests\Admin\LookupWorkshopModRequest;
 use App\Services\AuditLogger;
 use App\Services\DockerManager;
@@ -77,23 +78,25 @@ class ModController extends Controller
         ]);
     }
 
-    public function store(Request $request): JsonResponse
+    public function store(AddModRequest $request): JsonResponse
     {
-        $validated = $request->validate([
-            'workshop_id' => 'required|string|max:20',
-            'mod_id' => 'required|string|max:255',
-            'map_folder' => 'nullable|string|max:255',
-        ]);
+        $workshopId = $request->validated('workshop_id');
+        $modIds = $request->validated('mod_ids');
+        $mapFolder = $request->validated('map_folder');
 
         try {
             $this->modManager->add(
                 config('zomboid.paths.server_ini'),
-                $validated['workshop_id'],
-                $validated['mod_id'],
-                $validated['map_folder'] ?? null,
+                $workshopId,
+                $modIds,
+                $mapFolder,
             );
         } catch (RuntimeException $e) {
-            Log::error('Failed to add mod', ['exception' => $e, 'mod' => $validated]);
+            Log::error('Failed to add mod', [
+                'exception' => $e,
+                'workshop_id' => $workshopId,
+                'mod_ids' => $modIds,
+            ]);
 
             return response()->json([
                 'error' => 'Could not save mod to server config.',
@@ -103,13 +106,20 @@ class ModController extends Controller
         $this->auditLogger->log(
             actor: $request->user()->name ?? 'admin',
             action: 'mod.add',
-            target: $validated['workshop_id'],
-            details: $validated,
+            target: $workshopId,
+            details: [
+                'workshop_id' => $workshopId,
+                'mod_ids' => $modIds,
+                'map_folder' => $mapFolder,
+            ],
             ip: $request->ip(),
         );
 
         return response()->json([
-            'added' => $validated,
+            'added' => [
+                'workshop_id' => $workshopId,
+                'mod_ids' => $modIds,
+            ],
             'restart_required' => true,
         ], 201);
     }
@@ -122,10 +132,14 @@ class ModController extends Controller
             ], 422);
         }
 
+        $modId = $request->query('mod_id') ?? $request->input('mod_id');
+        $modId = is_string($modId) && $modId !== '' ? $modId : null;
+
         try {
             $removed = $this->modManager->remove(
                 config('zomboid.paths.server_ini'),
                 $workshopId,
+                $modId,
             );
         } catch (RuntimeException $e) {
             Log::error('Failed to remove mod', ['exception' => $e, 'workshop_id' => $workshopId]);
