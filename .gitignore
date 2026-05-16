@@ -51,3 +51,6 @@ workshop/ZomboidManager/Contents/mods/ZomboidManager/42/media/
 /app/.phpunit.result.cache
 /app/coverage/
 .playwright-mcp/
+.claude
+game-version.conf
+caddy/Caddyfile

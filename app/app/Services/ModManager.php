@@ -528,6 +528,11 @@ class ModManager
             }
             throw $e;
         }
+
+        // Signal the scheduled config-catalog rebuild: mod changes can shift
+        // which mod-namespaces appear inside `_SandboxVars.lua`, so the JSON
+        // catalog the admin UI hydrates from goes stale on every write here.
+        @touch(dirname($iniPath).'/.settings_catalog_dirty');
     }
 
     /**

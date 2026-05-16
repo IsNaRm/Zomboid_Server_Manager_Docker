@@ -20,6 +20,15 @@ Schedule::command('zomboid:sync-player-stats')->everyTenMinutes();
 
 Schedule::command('zomboid:auto-restart-check')->everyMinute();
 
+// Rebuild the JSON config catalog when ModManager / configure-server.sh
+// drops the dirty sentinel — mod changes can shift which namespaces
+// appear inside `_SandboxVars.lua`, and the admin UI hydrates from this
+// catalog for descriptions / min / max / enum labels.
+Schedule::command('zomboid:sync-config-catalog')
+    ->everyMinute()
+    ->when(fn () => is_file(rtrim(config('zomboid.paths.data', '/pz-data'), '/').'/Server/.settings_catalog_dirty')
+        || is_file(rtrim(config('zomboid.paths.data', '/pz-data'), '/').'/.settings_catalog_dirty'));
+
 Schedule::command('zomboid:import-pvp-violations')->everyFiveMinutes();
 
 Schedule::command('zomboid:import-pvp-kills')->everyFiveMinutes();

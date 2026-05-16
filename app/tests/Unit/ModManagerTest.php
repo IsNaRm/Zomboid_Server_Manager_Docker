@@ -16,7 +16,7 @@ afterEach(function () {
     if (file_exists($this->iniPath)) {
         unlink($this->iniPath);
     }
-    foreach (['.mod_state', '.mod_state_applied'] as $sidecar) {
+    foreach (['.mod_state', '.mod_state_applied', '.settings_catalog_dirty'] as $sidecar) {
         $path = $this->tempDir.'/Server/'.$sidecar;
         if (file_exists($path)) {
             unlink($path);
