@@ -41,10 +41,11 @@ Schedule::command('zomboid:process-shop-deliveries')->everyMinute();
 
 Schedule::command('zomboid:process-money-deposits')->everyMinute();
 
-Schedule::command('zomboid:generate-map-tiles')
-    ->everyThirtyMinutes()
-    ->when(fn () => ! is_dir(config('zomboid.map.tiles_path').'/html/map_data/base/layer0_files'))
-    ->runInBackground();
+Schedule::command('zomboid:auto-render-map')->everyMinute()->runInBackground();
+
+// Bump manifest.json version when save-game .bin files change so the browser
+// poller (useAtlasVersionPoll) can invalidate its save-data cache automatically.
+Schedule::command('zomboid:bump-map-version')->everyFiveMinutes();
 
 Schedule::command('zomboid:download-item-icons')
     ->hourly()

@@ -10,6 +10,22 @@ for var in DB_PASSWORD PZ_RCON_PASSWORD ADMIN_PASSWORD PZ_ADMIN_PASSWORD; do
     fi
 done
 
+# ── Nginx config rendering ───────────────────────────────────────────
+# WebGL cell-binary endpoints bypass PHP via nginx alias, which needs the
+# actual PZ map name and server name baked into the config. PZ_MAP_NAMES can
+# carry several maps separated by ";"; we use the first one as the primary
+# (which is also the one cell binaries live under on disk).
+NGINX_TEMPLATE="/etc/nginx/http.d/default.conf.template"
+NGINX_CONF="/etc/nginx/http.d/default.conf"
+if [ -f "$NGINX_TEMPLATE" ]; then
+    PZ_MAP_NAME_PRIMARY=$(printf '%s' "${PZ_MAP_NAMES:-Muldraugh, KY}" | cut -d';' -f1)
+    PZ_SERVER_NAME_VAR="${PZ_SERVER_NAME:-ZomboidServer}"
+    sed -e "s|@@PZ_MAP_NAME@@|${PZ_MAP_NAME_PRIMARY}|g" \
+        -e "s|@@PZ_SERVER_NAME@@|${PZ_SERVER_NAME_VAR}|g" \
+        "$NGINX_TEMPLATE" > "$NGINX_CONF"
+    echo "[entrypoint] Rendered nginx config (map='$PZ_MAP_NAME_PRIMARY', server='$PZ_SERVER_NAME_VAR')."
+fi
+
 # ── Storage permissions ──────────────────────────────────────────────
 # Bind mounts override Dockerfile permissions — fix at runtime
 # Only target directories and runtime files, skip .gitignore to avoid git noise
@@ -35,6 +51,12 @@ for dir in "$PZ_DATA/Saves" "$PZ_DATA/db"; do
         chmod -R g+w "$dir" 2>/dev/null || true
     fi
 done
+
+# Texturepacks upload target — www-data must be able to write here from
+# the admin UI before any base map render can succeed.
+TEXTUREPACKS_DIR="${PZ_MAP_TEXTUREPACKS_PATH:-$PZ_DATA/texturepacks}"
+mkdir -p "$TEXTUREPACKS_DIR" 2>/dev/null || true
+chown -R www-data:www-data "$TEXTUREPACKS_DIR" 2>/dev/null || true
 
 # ── Lua bridge permissions ────────────────────────────────────────────
 # Shared volume between game server and app — both www-data and steam (UID 1001)
@@ -103,12 +125,9 @@ if echo "$@" | grep -q "supervisord"; then
         php artisan zomboid:create-admin --no-interaction 2>&1 || true
     fi
 
-    # Map tiles — generate in background if missing
-    if [ ! -d "${PZ_MAP_TILES_PATH:-/map-tiles}/html/map_data/base/layer0_files" ] && [ -d "${PZ_SERVER_PATH:-/pz-server}" ]; then
-        echo "[entrypoint] Map tiles not found — generating in background..."
-        php artisan zomboid:generate-map-tiles \
-            >> /var/www/html/storage/logs/map-tiles.log 2>&1 &
-    fi
+    # Map tiles are no longer auto-generated. Admins opt in via the
+    # "Map render engine" panel on /admin/players/map, which dispatches
+    # a queued job after explicit confirmation.
 
     # Item icons — download in background if catalog exists but icons are missing
     ICON_DIR="/var/www/html/public/images/items"

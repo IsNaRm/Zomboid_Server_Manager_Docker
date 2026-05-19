@@ -21,6 +21,7 @@ return [
     'docker' => [
         'proxy_url' => env('DOCKER_PROXY_URL', 'http://docker-socket-proxy:2375'),
         'container_name' => env('GAME_SERVER_CONTAINER_NAME', 'pz-game-server'),
+        'queue_container_name' => env('QUEUE_CONTAINER_NAME', 'pz-queue'),
     ],
 
     /*
@@ -52,6 +53,7 @@ return [
 
     'map' => [
         'tiles_path' => env('PZ_MAP_TILES_PATH', '/map-tiles'),
+        'texturepacks_path' => env('PZ_MAP_TEXTUREPACKS_PATH', '/pz-data/texturepacks'),
         'tile_size' => 256,
         'min_zoom' => 13,
         'max_zoom' => 17,

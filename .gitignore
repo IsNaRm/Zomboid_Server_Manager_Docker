@@ -54,3 +54,10 @@ workshop/ZomboidManager/Contents/mods/ZomboidManager/42/media/
 .claude
 game-version.conf
 caddy/Caddyfile
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Reference clones (kept locally for research, not part of the product)
+pzmap2dzi_repo/
