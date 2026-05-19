@@ -178,3 +178,120 @@ export function bindAtlasArray(
     gl.activeTexture(gl.TEXTURE0 + unit);
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
 }
+
+// ---------------------------------------------------------------------------
+// Compressed-texture support — atlas pages can be served as KTX2/BC7 (desktop)
+// or KTX2/ASTC (mobile) to cut VRAM by ~4×. The format is decided at runtime
+// via WebGL extensions; uncompressed WebP is the fallback.
+// ---------------------------------------------------------------------------
+
+import {
+    GL_COMPRESSED_RGBA_BPTC_UNORM_EXT,
+    GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT,
+    GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+    GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR,
+    type Ktx2Texture,
+} from '../ktx2-decoder';
+import type { CompressedTextureFormat } from '../types';
+
+export interface CompressedTextureSupport {
+    /** Preferred format, or null when the GPU can't decode any of them. */
+    format: CompressedTextureFormat | null;
+    /** The GL internal format we'd use (RGBA8 when format is null). */
+    glInternalFormat: number;
+    /** Whether the extension is exposed at all. */
+    hasBptc: boolean;
+    hasAstc: boolean;
+}
+
+/**
+ * Detect compressed-texture capability of the current GL context. We try BC7
+ * first (universally supported on desktop), then ASTC (mobile / Apple
+ * silicon). Returns null format on contexts that support neither.
+ */
+export function detectCompressedFormat(gl: WebGL2RenderingContext): CompressedTextureSupport {
+    const hasBptc = gl.getExtension('EXT_texture_compression_bptc') !== null;
+    const hasAstc = gl.getExtension('WEBGL_compressed_texture_astc') !== null;
+
+    if (hasBptc) {
+        return {
+            format: 'BC7',
+            glInternalFormat: GL_COMPRESSED_RGBA_BPTC_UNORM_EXT,
+            hasBptc: true,
+            hasAstc,
+        };
+    }
+    if (hasAstc) {
+        return {
+            format: 'ASTC_4x4',
+            glInternalFormat: GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+            hasBptc: false,
+            hasAstc: true,
+        };
+    }
+    return {
+        format: null,
+        glInternalFormat: gl.RGBA8,
+        hasBptc: false,
+        hasAstc: false,
+    };
+}
+
+/**
+ * Allocate an empty TEXTURE_2D_ARRAY for a compressed atlas. Identical to
+ * createAtlasArray except `internalFormat` is one of the GL_COMPRESSED_*
+ * constants and the storage allocation is opaque (driver picks block layout).
+ */
+export function createCompressedAtlasArray(
+    gl: WebGL2RenderingContext,
+    size: number,
+    layerCount: number,
+    glInternalFormat: number,
+): WebGLTexture {
+    const tex = gl.createTexture();
+    if (!tex) { throw new Error('[pz-renderer] Failed to create compressed atlas array texture'); }
+
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, glInternalFormat, size, size, layerCount);
+
+    // Compressed BC7/ASTC formats already filter cleanly in linear, no mipchain.
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+    return tex;
+}
+
+/**
+ * Upload one layer of a TEXTURE_2D_ARRAY from a decoded KTX2 payload.
+ * `tex.width`/`tex.height` must match the array's per-layer dimensions.
+ *
+ * Caller is responsible for ensuring `tex.glInternalFormat` matches the
+ * format the array was allocated with — mixing BC7 data into an ASTC array
+ * (or vice-versa) is silently invalid and produces solid colour blocks.
+ */
+export function uploadCompressedAtlasArrayLayer(
+    gl: WebGL2RenderingContext,
+    texture: WebGLTexture,
+    layer: number,
+    tex: Ktx2Texture,
+): void {
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+    gl.compressedTexSubImage3D(
+        gl.TEXTURE_2D_ARRAY,
+        0,                  // mip level
+        0, 0, layer,        // x, y, z offsets
+        tex.width, tex.height, 1,
+        tex.glInternalFormat,
+        tex.data,
+    );
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+}
+
+// Suppress unused-variable warnings (re-export constants for callers).
+export {
+    GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT,
+    GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR,
+};

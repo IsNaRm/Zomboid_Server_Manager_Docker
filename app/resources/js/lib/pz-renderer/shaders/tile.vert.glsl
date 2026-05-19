@@ -27,6 +27,7 @@ uniform vec2  u_worldOriginPx;    // image-pixel value of world square (0,0)
 uniform float u_pixelsPerSquare;  // canvas pixels per PZ square at current zoom
 uniform float u_cellSizeInSquares;
 uniform float u_nativeToEffective; // = 1/2^skip; converts native px → effective DZI px
+uniform float u_cellStride;       // ≥1; sample spacing in cells (also sprite scale at zoom-out)
 
 // Outputs to fragment
 out vec2  v_squareCoord;  // (0..1) — sample uv within sprite UV rect
@@ -62,8 +63,13 @@ void main() {
     //   topLeft = bottomCenter + (offset_x, offset_y) — offsets are native px,
     //   so convert via u_nativeToEffective. Both axes are AXIS-ALIGNED in
     //   pixel-space — sprite is a native-sized rect, not an iso romb.
-    vec2 spriteSizePx = vec2(a_spriteW, a_spriteH) * u_nativeToEffective;
-    vec2 offsetPx     = vec2(a_offsetX, a_offsetY) * u_nativeToEffective;
+    //
+    // When cell-stride > 1 we render 1 cell out of every N×N block; to
+    // visually cover the skipped neighbours we scale BOTH the sprite
+    // size and its anchor offset by `u_cellStride`. Each rendered sprite
+    // then visually represents a stride²-cell area.
+    vec2 spriteSizePx = vec2(a_spriteW, a_spriteH) * u_nativeToEffective * u_cellStride;
+    vec2 offsetPx     = vec2(a_offsetX, a_offsetY) * u_nativeToEffective * u_cellStride;
     vec2 topLeftPx    = bottomCenterPx + offsetPx;
     vec2 cornerPx     = topLeftPx + a_quadCoord * spriteSizePx;
 

@@ -43,11 +43,34 @@ export interface AtlasPageInfo {
     size_bytes: number;
 }
 
+/** Per-LOD descriptor in the manifest. lod=0 is native; higher = smaller. */
+export interface AtlasLodInfo {
+    /** LOD index (0..N). 0 = native (highest detail). */
+    id: number;
+    /** Linear scale relative to LOD 0 — 1.0, 0.5, 0.25, 0.125, ... */
+    scale: number;
+    /** Edge size of the atlas at this LOD in pixels. */
+    size: number;
+}
+
+/** Compressed texture format identifier (matches the server-emitted KTX2). */
+export type CompressedTextureFormat = 'BC7' | 'ASTC_4x4';
+
+/** Format used to encode atlas pages on disk. */
+export type AtlasPageFormat = 'webp' | 'ktx2';
+
 /** Parsed sprites.json manifest. */
 export interface SpritesManifest {
     version: string;
     atlas_size: number;
     atlases: AtlasPageInfo[];
+    /**
+     * Format of sprite UV mips:
+     *   'pixels'     — legacy (mips contain absolute atlas pixels)
+     *   'normalized' — mips contain ratios [0..1] of the atlas page edge
+     * When undefined, treated as 'pixels' for backwards-compat.
+     */
+    uv_format?: 'pixels' | 'normalized';
     /** Raw sprite map from JSON — values have mips as number[][] not MipLevel[]. */
     sprites: Record<
         string,
@@ -59,6 +82,14 @@ export interface SpritesManifest {
         }
     >;
 }
+
+/**
+ * cell-pages.json: maps "cellX_cellY" → list of atlas page IDs needed to
+ * render that cell. Emitted by the backend atlas builder so the frontend
+ * can pre-load only the pages required for a given viewport instead of
+ * eagerly loading all 51 pages on init.
+ */
+export type CellPagesMap = Record<string, number[]>;
 
 /** Fully loaded atlas ready for WebGL upload. */
 export interface LoadedAtlas {

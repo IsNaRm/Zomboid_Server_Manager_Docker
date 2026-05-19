@@ -1,6 +1,7 @@
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { RenderTuningPanel } from '@/components/render-tuning-panel';
 import { defaultCellCache } from '@/lib/pz-renderer/cell-cache';
 import { fetchCellsForTile } from '@/lib/pz-renderer/tile-cells';
 import type { CellData, DziProjection } from '@/lib/pz-renderer/types';
@@ -430,11 +431,11 @@ export default function PzMap({
             console.log(`[DBG][layer] skip: map=${!!map} dzi=${!!mapConfig.dzi}`);
             return;
         }
-        if (!webgl.renderer || !webgl.atlasTexture || !webgl.spriteIndex) {
-            console.log(`[DBG][layer] WebGL not ready: renderer=${!!webgl.renderer} atlas=${!!webgl.atlasTexture} sprites=${!!webgl.spriteIndex} progress=${webgl.progress} error=${webgl.error}`);
+        if (!webgl.renderer || !webgl.atlasManager || !webgl.spriteIndex || !webgl.lods) {
+            console.log(`[DBG][layer] WebGL not ready: renderer=${!!webgl.renderer} atlasManager=${!!webgl.atlasManager} sprites=${!!webgl.spriteIndex} lods=${!!webgl.lods} progress=${webgl.progress} error=${webgl.error}`);
             return;
         }
-        console.log(`[DBG][layer] attaching WebGLPZLayer, availableCells=${availableCells?.size ?? 'undefined/null'}`);
+        console.log(`[DBG][layer] attaching WebGLPZLayer, availableCells=${availableCells?.size ?? 'undefined/null'} lods=${webgl.lods.length} cellPages=${webgl.cellPages !== null}`);
 
         const projection: DziProjection = {
             x0: mapConfig.dzi.x0,
@@ -489,7 +490,10 @@ export default function PzMap({
         };
 
         const layer = new WebGLPZLayer(webgl.renderer, {
-            atlas: webgl.atlasTexture,
+            atlasManager: webgl.atlasManager,
+            lods: webgl.lods,
+            cellPages: webgl.cellPages,
+            uvFormat: webgl.uvFormat,
             spriteIndex: webgl.spriteIndex,
             projection,
             fetchCellData,
@@ -508,7 +512,7 @@ export default function PzMap({
                 webglLayerRef.current = null;
             }
         };
-    }, [webgl.renderer, webgl.atlasTexture, webgl.spriteIndex, mapConfig.dzi, mapConfig.minZoom, mapConfig.maxZoom, availableCells]);
+    }, [webgl.renderer, webgl.atlasManager, webgl.spriteIndex, webgl.lods, webgl.cellPages, webgl.uvFormat, mapConfig.dzi, mapConfig.minZoom, mapConfig.maxZoom, availableCells]);
 
     // Update cursor for drawing mode
     useEffect(() => {
@@ -652,6 +656,15 @@ export default function PzMap({
     return (
         <div className={`relative isolate h-full w-full ${className}`}>
             <div ref={containerRef} className="absolute inset-0" />
+            {wantWebGL && webgl.renderer && mapConfig.dzi && (
+                <RenderTuningPanel
+                    map={mapRef.current}
+                    projection={{
+                        sqr: mapConfig.dzi.sqr,
+                        maxNativeZoom: mapConfig.dzi.maxNativeZoom,
+                    }}
+                />
+            )}
             {showOverlay && (
                 <div className="absolute inset-0 z-[1000] flex flex-col items-center justify-center bg-zinc-950/85 text-zinc-100 backdrop-blur-sm">
                     <div className="w-72 max-w-[80%] space-y-3">

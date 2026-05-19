@@ -46,6 +46,7 @@ import type { CellData, CellMetadata, DziProjection, LotpackData, SquareLayerDat
 import type { WorkerPool } from './workers/worker-pool';
 import type { CellCache } from './cell-cache';
 import { extractCellsFromChunk, fetchChunkBinary, loadChunkIndex } from './cell-chunks';
+import { cellStrideForTuning } from './render-tuning';
 
 // ---------------------------------------------------------------------------
 // Public API types
@@ -254,12 +255,35 @@ export function computeCellsForTile(
         return [];
     }
 
+    // Cell-stride at extreme zoom-out: when one PZ cell occupies fewer
+    // than MIN_CELL_PIXELS pixels on screen, fetch only every N-th cell
+    // (uniform sampling). At pixelsPerSquare = 0.03 (max zoom-out for
+    // Knox), one cell is ~8 pixels, so a stride of 2 already saves 4×
+    // memory; stride 4 saves 16×. The skipped cells contribute nothing
+    // visually because their entire 256² square content collapses into
+    // sub-pixel regions.
+    //
+    // We aim for each sampled cell to occupy ~MIN_CELL_PIXELS screen px
+    // so the sampling grid stays dense enough that no map area appears
+    // wholly absent. The renderer's decimateStep handles per-square
+    // sampling on top of this.
+    //
+    // Scale: pixelsPerSquare = sqr * 2^(z - maxNativeZoom).
+    // Stride is delegated to render-tuning so the user's UI override
+    // takes precedence over the auto policy.
+    const pixelsPerSquare = sqr * Math.pow(2, z - maxNativeZoom);
+    const cellStride = cellStrideForTuning(pixelsPerSquare, cellSize);
+
     const cells: CellCoord[] = [];
-    for (let cx = cxMin; cx <= cxMax; cx++) {
+    // Stride alignment: anchor on multiples of cellStride so adjacent
+    // tiles share the same sampled cells (avoids per-tile aliasing and
+    // duplicate cache misses).
+    const stridedMin = (n: number): number => Math.floor(n / cellStride) * cellStride;
+    for (let cx = stridedMin(cxMin); cx <= cxMax; cx += cellStride) {
         // Skip negative coordinates (PZ world starts at (0, 0)) and cells
         // beyond the known on-disk bounds (avoids guaranteed 404 round-trips).
         if (cx < 0 || cx > maxCellX) continue;
-        for (let cy = cyMin; cy <= cyMax; cy++) {
+        for (let cy = stridedMin(cyMin); cy <= cyMax; cy += cellStride) {
             if (cy < 0 || cy > maxCellY) continue;
             cells.push([cx, cy] as const);
         }

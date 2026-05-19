@@ -34,7 +34,15 @@ export function isHalfWater(name: string): boolean {
 /**
  * Build a fast SpriteIndex (Map) from the raw sprites.json manifest.
  *
- * Converts the raw number[][] mips format from JSON into typed MipLevel objects.
+ * Normalises both UV layouts (legacy "pixels" and post-LOD "normalized")
+ * to the same internal representation: `MipLevel.{u,v,w,h}` are always
+ * stored in ABSOLUTE LOD-0 atlas pixels. The renderer divides by
+ * atlasWidth/atlasHeight when writing the GLSL UV attribute, and uses
+ * the raw pixel values for the `a_spriteW`/`a_spriteH` attributes that
+ * drive `spriteSizePx = (a_spriteW, a_spriteH) * u_nativeToEffective`
+ * in the vertex shader. Mixing the two formats (writing a ratio where
+ * the shader expects pixels) collapses sprites to zero size — they
+ * upload to the GPU but never produce visible fragments.
  *
  * @param manifest  Parsed sprites.json object.
  * @returns         Fast Map for O(1) sprite name lookup.
@@ -42,8 +50,21 @@ export function isHalfWater(name: string): boolean {
 export function buildSpriteIndex(manifest: SpritesManifest): SpriteIndex {
     const index: SpriteIndex = new Map();
 
+    // When the backend writes UVs as normalised [0..1] ratios, multiply
+    // by atlas_size to recover the native LOD-0 pixel coordinates. The
+    // atlas_size field is part of the manifest exactly so we can do
+    // this re-scale without hardcoding a 4096 anywhere downstream.
+    const pixelScale = manifest.uv_format === 'normalized'
+        ? Math.max(1, manifest.atlas_size)
+        : 1;
+
     for (const [name, raw] of Object.entries(manifest.sprites)) {
-        const mips: MipLevel[] = raw.mips.map(([u, v, w, h]) => ({ u, v, w, h }));
+        const mips: MipLevel[] = raw.mips.map(([u, v, w, h]) => ({
+            u: u * pixelScale,
+            v: v * pixelScale,
+            w: w * pixelScale,
+            h: h * pixelScale,
+        }));
 
         const entry: SpriteEntry = {
             atlas: raw.atlas,

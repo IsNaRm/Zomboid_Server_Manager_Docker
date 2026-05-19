@@ -32,6 +32,16 @@ import { type PlantsConfig, PlantsInfo, remapSpriteName, defaultPlantsInfo } fro
 // Public types
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolves global atlas page IDs to the TEXTURE_2D_ARRAY slot they
+ * currently occupy. Implemented by AtlasPageManager so the renderer
+ * stays decoupled from page-residency policy.
+ */
+export interface AtlasPageLookup {
+    /** Returns the GL array layer for `(pageId, lod)`, or -1 when not resident. */
+    slotForPage(pageId: number, lod: number): number;
+}
+
 export interface TileRenderInput {
     z: number;
     x: number;
@@ -40,21 +50,42 @@ export interface TileRenderInput {
     tileSize: number;
     /** Parsed cell data covering this tile. */
     cells: CellData[];
-    /** TEXTURE_2D_ARRAY containing every atlas page as a layer. */
+    /** TEXTURE_2D_ARRAY containing the active LOD's resident pages. */
     atlas: WebGLTexture;
+    /** Atlas LOD currently active. Used to look up slot indices. */
+    lod: number;
+    /** Page-id → array-slot lookup (typically the AtlasPageManager). */
+    pageLookup: AtlasPageLookup;
     /** Sprite name → entry (with atlas page index + UV rects per mip). */
     spriteIndex: SpriteIndex;
     /** DZI projection parameters. */
     projection: DziProjection;
-    /** Atlas page width in pixels (normalises sprite UVs). Default 4096. */
+    /**
+     * Atlas page width in pixels at this LOD. Only used when uvFormat is
+     * 'pixels' (legacy backend); ignored for 'normalized' format.
+     */
     atlasWidth?: number;
-    /** Atlas page height in pixels. Default 4096. */
+    /** Same as atlasWidth, vertical. */
     atlasHeight?: number;
+    /**
+     * UV format used by sprites.json:
+     *   'normalized' — mips already in [0..1] range (multi-LOD pipeline)
+     *   'pixels'     — mips in absolute atlas pixels (legacy)
+     */
+    uvFormat?: 'pixels' | 'normalized';
+    /**
+     * Cell-stride applied by the layer (= 1 when stride disabled, > 1
+     * at extreme zoom-out). Used as a SHADER uniform to scale each
+     * sprite so the sampled cell visually covers the area of skipped
+     * neighbours.
+     */
+    cellStride?: number;
     /** Optional seasonal plants remap. */
     plantsConfig?: PlantsConfig;
     /**
-     * Optional set of atlas page indices already uploaded to the GPU.
-     * Instances referring to pages outside this set are skipped.
+     * Optional set of atlas page IDs whose data is currently resident.
+     * Instances referring to pages outside this set are skipped (the tile
+     * appears progressively as the manager finishes loading pages).
      */
     availablePages?: Set<number> | null;
     /**
@@ -99,6 +130,7 @@ const U = {
     pixelsPerSquare: 'u_pixelsPerSquare',
     cellSizeInSquares: 'u_cellSizeInSquares',
     nativeToEffective: 'u_nativeToEffective',
+    cellStride: 'u_cellStride',
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -115,6 +147,13 @@ export class PzGLRenderer {
     /** Diagnostic counter — log a few tiles in detail then go quiet. */
     private _diagTilesLogged = 0;
     private static readonly DIAG_TILES_TO_LOG = 5;
+
+    /** Sliding-window peak of recent renderTile() instance counts. Used to
+     *  shrink the instanceData typed array after sustained low peaks. */
+    private _peakWindow: number[] = [];
+    private static readonly PEAK_WINDOW = 32;
+    /** Floor below which the instance buffer never shrinks. */
+    private static readonly MIN_RETAINED_INSTANCES = 8192;
 
     private _plantsCache = new Map<string, PlantsInfo>();
 
@@ -215,16 +254,23 @@ export class PzGLRenderer {
         setUniform1f(gl, this.program, U.pixelsPerSquare, pixelsPerSquare);
         setUniform1f(gl, this.program, U.cellSizeInSquares, cellSizeInSquares);
         setUniform1f(gl, this.program, U.nativeToEffective, nativeToEffective);
+        setUniform1f(gl, this.program, U.cellStride, Math.max(1, input.cellStride ?? 1));
 
         const verbose = this._diagTilesLogged < PzGLRenderer.DIAG_TILES_TO_LOG && cells.length > 0;
+        const uvFormat = input.uvFormat ?? 'pixels';
         const instanceCount = this._collectInstances(
             cells, spriteIndex, plantsInfo, atlasWidth, atlasHeight,
             input.availablePages ?? null,
             layerRange,
             cellSizeInSquares,
             pixelsPerSquare,
+            input.lod,
+            input.pageLookup,
+            uvFormat,
             verbose,
         );
+
+        this._trackPeakAndShrink(instanceCount);
 
         if (instanceCount === 0) {
             if (verbose) {
@@ -336,8 +382,21 @@ export class PzGLRenderer {
      * Pack every visible (square, sprite) pair into the instance buffer.
      * Returns the total instance count actually written.
      *
-     * Order is layer-ascending then sprite-stack ascending so alpha blending
-     * paints lower sprites first.
+     * Iteration is block-major (one block lookup per bx/by instead of per
+     * world square), then layer-major within the block (one layerData
+     * lookup instead of per square). Both lookups previously happened in
+     * the deepest loop, costing 65 536 × layers × cells redundant Map/Array
+     * accesses on every tile render at native zoom. Even at decimateStep=64
+     * the outer loop has 4 × 4 = 16 iterations per cell, but each one re-
+     * resolved blockData and layerData — now they're resolved once per
+     * block per layer.
+     *
+     * The block-major loop also lets us early-skip blocks that have no
+     * data without iterating their squares at all (sparse rural cells are
+     * mostly empty blocks).
+     *
+     * Order is layer-ascending then sprite-stack ascending so alpha
+     * blending paints lower sprites first.
      */
     private _collectInstances(
         cells: CellData[],
@@ -349,6 +408,9 @@ export class PzGLRenderer {
         layerRange: { min: number; max: number },
         cellSizeInSquares: number,
         pixelsPerSquare: number,
+        lod: number,
+        pageLookup: AtlasPageLookup,
+        uvFormat: 'pixels' | 'normalized',
         verbose: boolean,
     ): number {
         // Overview LOD strategy: when one PZ square covers < 1 screen pixel
@@ -369,24 +431,20 @@ export class PzGLRenderer {
             ? 1
             : Math.max(1, Math.round(1 / pixelsPerSquare));
         const decimateStep = pickDivisorAtMost(cellSizeInSquares, targetStep);
-        // Single-pass write directly into the shared instance buffer. No
-        // per-cell allocations, no two-pass count+fill, no intermediate
-        // arrays — the GC was killing us with anything else.
-        //
-        // The buffer GROWS dynamically when full. A static cap (with `break`
-        // on overflow) produced the bottom-right grey triangle: the outer
-        // loop iterates `wsx` from 0 → cellEdge, so dropped instances
-        // accumulate on high-`wsx` squares, which project to the right-bottom
-        // edge of every cell rhombus in the iso projection. A single dense
-        // cell (e.g. an urban one with multi-floor sprite stacks) needs
-        // ~200K instances on the ground layer alone — the old 16384 / cell
-        // estimate clipped ~92% of them.
-        //
-        // The first call still pre-allocates a sensible starting size based
-        // on average cell density; subsequent calls reuse whatever ended up
-        // being needed (the buffer only ever grows across the renderer's
-        // lifetime, so steady-state is one Float32Array allocation).
-        const estimateInstances = Math.max(8192, cells.length * 65536);
+        // Right-size the initial buffer based on decimation: stepsPerEdge²
+        // squares per cell × layers × an average sprite stack of ~4. At
+        // decimateStep=64 a tile spanning 20 cells needs ~1 280 instances;
+        // at decimateStep=1 the same span needs ~5 M. The old static
+        // estimate of cells×65 536 floats over-allocated by 64× at typical
+        // zoom-out — the new estimate is ≥10× smaller, and ensureCapacity
+        // still grows the buffer if the actual content exceeds it.
+        const stepsPerEdge = Math.ceil(cellSizeInSquares / decimateStep);
+        const layerCount = Math.max(1, layerRange.max - layerRange.min + 1);
+        const AVG_STACK = 4;
+        const estimateInstances = Math.max(
+            PzGLRenderer.MIN_RETAINED_INSTANCES,
+            cells.length * stepsPerEdge * stepsPerEdge * layerCount * AVG_STACK,
+        );
         const initialNeed = estimateInstances * INSTANCE_STRIDE_F32;
         if (this.instanceData.length < initialNeed) {
             this.instanceData = new Float32Array(initialNeed);
@@ -414,92 +472,116 @@ export class PzGLRenderer {
 
         for (const cell of cells) {
             const { cellX, cellY, header, cell: squareLayerData } = cell;
-            const { cellSizeInBlocks, blockSize, minLayer, maxLayer } = header;
+            const { cellSizeInBlocks, blockSize, minLayer, maxLayer, spriteNames } = header;
             const lp = squareLayerData.lotpack;
+            const blocks = lp.blocks;
 
             const lMin = Math.max(minLayer, layerRange.min);
             const lMax = Math.min(maxLayer - 1, layerRange.max);
 
-            const cellEdge = cellSizeInBlocks * blockSize;
+            for (let bx = 0; bx < cellSizeInBlocks; bx++) {
+                const blockOriginX = bx * blockSize;
+                // First step-aligned local-x inside this block. When the
+                // block lies between two grid-aligned step samples the
+                // expression is ≥ blockSize and the whole block is skipped.
+                const lsxStart = ((decimateStep - (blockOriginX % decimateStep)) % decimateStep);
+                if (lsxStart >= blockSize) continue;
 
-            for (let layer = lMin; layer <= lMax; layer++) {
-                const layerIdx = layer - minLayer;
+                const rowBase = bx * cellSizeInBlocks;
 
-                // World-square step iteration. For decimateStep=1 we walk
-                // every square (no skip); for high steps (overview zooms) we
-                // visit only one in N², which is N² less work — critical so
-                // a viewport spanning the whole map doesn't freeze the UI.
-                for (let wsx = 0; wsx < cellEdge; wsx += decimateStep) {
-                    const bx = (wsx / blockSize) | 0;
-                    const lsx = wsx - bx * blockSize;
-                    for (let wsy = 0; wsy < cellEdge; wsy += decimateStep) {
-                        const by = (wsy / blockSize) | 0;
-                        const lsy = wsy - by * blockSize;
+                for (let by = 0; by < cellSizeInBlocks; by++) {
+                    const blockData = blocks[rowBase + by];
+                    if (!blockData) continue;
+                    const blockOriginY = by * blockSize;
+                    const lsyStart = ((decimateStep - (blockOriginY % decimateStep)) % decimateStep);
+                    if (lsyStart >= blockSize) continue;
 
-                        const blockData = lp.blocks[bx * cellSizeInBlocks + by];
-                        if (!blockData) continue;
-                        const layerData = blockData[layerIdx];
+                    for (let layer = lMin; layer <= lMax; layer++) {
+                        const layerData = blockData[layer - minLayer];
                         if (!layerData) continue;
-                        const col = layerData[lsx];
-                        if (!col) continue;
-                        const spriteIndices = col[lsy];
-                        if (!spriteIndices || spriteIndices.length === 0) continue;
 
-                        for (let ii = 0; ii < spriteIndices.length; ii++) {
-                            const idx = spriteIndices[ii]!;
-                            const originalName = header.spriteNames[idx];
-                            if (!originalName) continue;
-                            const resolvedNames = remapSpriteName(originalName, plantsInfo);
-                            for (let rn = 0; rn < resolvedNames.length; rn++) {
-                                const name = resolvedNames[rn]!;
-                                spritesAttempted++;
-                                const entry = spriteIndex.get(name);
-                                if (!entry || entry.mips.length === 0) {
-                                    spritesMissing++;
-                                    if (missingNamesSample.length < 5
-                                        && !missingNamesSample.includes(name)) {
-                                        missingNamesSample.push(name);
-                                    }
-                                    continue;
-                                }
-                                if (availablePages !== null && !availablePages.has(entry.atlas)) {
-                                    spritesSkippedPage++;
-                                    continue;
-                                }
-                                if (n >= cap) { ensureCapacity(n + 1); }
-                                spritesMatched++;
+                        for (let lsx = lsxStart; lsx < blockSize; lsx += decimateStep) {
+                            const col = layerData[lsx];
+                            if (!col) continue;
+                            const wsx = blockOriginX + lsx;
+                            for (let lsy = lsyStart; lsy < blockSize; lsy += decimateStep) {
+                                const spriteIndices = col[lsy];
+                                if (!spriteIndices || spriteIndices.length === 0) continue;
+                                const wsy = blockOriginY + lsy;
 
-                                // Sprite ALWAYS rendered at native pixel size (mips[0]);
-                                // pick a smaller mip rect only for UV sampling to kill
-                                // minification aliasing at low zoom.
-                                const nativeMip = entry.mips[0]!;
-                                let sampleMip = nativeMip;
-                                if (targetMipPx < sampleMip.w) {
-                                    for (let mi = 1; mi < entry.mips.length; mi++) {
-                                        const next = entry.mips[mi]!;
-                                        if (next.w >= targetMipPx) {
-                                            sampleMip = next;
-                                        } else {
-                                            break;
+                                for (let ii = 0; ii < spriteIndices.length; ii++) {
+                                    const idx = spriteIndices[ii]!;
+                                    const originalName = spriteNames[idx];
+                                    if (!originalName) continue;
+                                    const resolvedNames = remapSpriteName(originalName, plantsInfo);
+                                    for (let rn = 0; rn < resolvedNames.length; rn++) {
+                                        const name = resolvedNames[rn]!;
+                                        spritesAttempted++;
+                                        const entry = spriteIndex.get(name);
+                                        if (!entry || entry.mips.length === 0) {
+                                            spritesMissing++;
+                                            if (missingNamesSample.length < 5
+                                                && !missingNamesSample.includes(name)) {
+                                                missingNamesSample.push(name);
+                                            }
+                                            continue;
                                         }
+                                        if (availablePages !== null && !availablePages.has(entry.atlas)) {
+                                            spritesSkippedPage++;
+                                            continue;
+                                        }
+                                        // Resolve the GL array slot. Page may be
+                                        // marked available but not yet uploaded if
+                                        // residency state and `availablePages`
+                                        // diverged — defensively skip.
+                                        const slot = pageLookup.slotForPage(entry.atlas, lod);
+                                        if (slot < 0) {
+                                            spritesSkippedPage++;
+                                            continue;
+                                        }
+                                        if (n >= cap) { ensureCapacity(n + 1); }
+                                        spritesMatched++;
+
+                                        // Sprite ALWAYS rendered at native pixel size (mips[0]);
+                                        // pick a smaller mip rect only for UV sampling to kill
+                                        // minification aliasing at low zoom.
+                                        const nativeMip = entry.mips[0]!;
+                                        let sampleMip = nativeMip;
+                                        if (targetMipPx < sampleMip.w) {
+                                            for (let mi = 1; mi < entry.mips.length; mi++) {
+                                                const next = entry.mips[mi]!;
+                                                if (next.w >= targetMipPx) {
+                                                    sampleMip = next;
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        // mips are always stored in LOD-0 native pixels
+                                        // (buildSpriteIndex rescales normalised UVs
+                                        // back to pixels), so the GLSL UV attribute
+                                        // is always `pixelCoord / atlasWidth` regardless
+                                        // of how the JSON was authored.
+                                        const off = n * INSTANCE_STRIDE_F32;
+                                        const uScale = 1 / atlasWidth;
+                                        const vScale = 1 / atlasHeight;
+                                        data[off +  0] = wsx;
+                                        data[off +  1] = wsy;
+                                        data[off +  2] = cellX;
+                                        data[off +  3] = cellY;
+                                        data[off +  4] = sampleMip.u * uScale;
+                                        data[off +  5] = sampleMip.v * vScale;
+                                        data[off +  6] = sampleMip.w * uScale;
+                                        data[off +  7] = sampleMip.h * vScale;
+                                        data[off +  8] = slot;
+                                        data[off +  9] = isHalfWater(name) ? 1.0 : 0.0;
+                                        data[off + 10] = nativeMip.w;
+                                        data[off + 11] = nativeMip.h;
+                                        data[off + 12] = entry.offset_x;
+                                        data[off + 13] = entry.offset_y;
+                                        n++;
                                     }
                                 }
-                                const off = n * INSTANCE_STRIDE_F32;
-                                data[off +  0] = wsx;
-                                data[off +  1] = wsy;
-                                data[off +  2] = cellX;
-                                data[off +  3] = cellY;
-                                data[off +  4] = sampleMip.u / atlasWidth;
-                                data[off +  5] = sampleMip.v / atlasHeight;
-                                data[off +  6] = sampleMip.w / atlasWidth;
-                                data[off +  7] = sampleMip.h / atlasHeight;
-                                data[off +  8] = entry.atlas;
-                                data[off +  9] = isHalfWater(name) ? 1.0 : 0.0;
-                                data[off + 10] = nativeMip.w;
-                                data[off + 11] = nativeMip.h;
-                                data[off + 12] = entry.offset_x;
-                                data[off + 13] = entry.offset_y;
-                                n++;
                             }
                         }
                     }
@@ -510,6 +592,7 @@ export class PzGLRenderer {
         if (verbose) {
             console.log(
                 `[DBG][collect] cells=${cells.length} instances=${n} `
+                + `step=${decimateStep} stepsPerEdge=${stepsPerEdge} cap=${cap} `
                 + `attempted=${spritesAttempted} matched=${spritesMatched} `
                 + `missing=${spritesMissing} pageSkipped=${spritesSkippedPage} `
                 + `layerRange=[${layerRange.min}..${layerRange.max}]`
@@ -518,5 +601,37 @@ export class PzGLRenderer {
         }
 
         return n;
+    }
+
+    /**
+     * Track the latest instance count and shrink the typed array if it has
+     * been over-sized for PEAK_WINDOW consecutive renders. Without this the
+     * buffer grows monotonically — a single zoom-in to a dense urban cell
+     * locks ~50 MB of typed-array memory for the rest of the session even
+     * after the user zooms back out to a sparse view.
+     */
+    private _trackPeakAndShrink(instanceCount: number): void {
+        this._peakWindow.push(instanceCount);
+        if (this._peakWindow.length < PzGLRenderer.PEAK_WINDOW) return;
+        if (this._peakWindow.length > PzGLRenderer.PEAK_WINDOW) {
+            this._peakWindow.shift();
+        }
+
+        let peak = 0;
+        for (let i = 0; i < this._peakWindow.length; i++) {
+            const v = this._peakWindow[i]!;
+            if (v > peak) peak = v;
+        }
+        const currentCap = (this.instanceData.length / INSTANCE_STRIDE_F32) | 0;
+        // Shrink only when peak occupies less than a quarter of capacity and
+        // we'd still keep at least MIN_RETAINED_INSTANCES headroom.
+        const targetCap = Math.max(
+            PzGLRenderer.MIN_RETAINED_INSTANCES,
+            peak * 2, // 2× headroom — avoids immediate regrow if next peak rises
+        );
+        if (currentCap > targetCap * 2) {
+            this.instanceData = new Float32Array(targetCap * INSTANCE_STRIDE_F32);
+            this._peakWindow.length = 0;
+        }
     }
 }

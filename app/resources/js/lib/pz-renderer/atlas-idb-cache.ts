@@ -59,7 +59,19 @@ function openDB(): Promise<IDBDatabase | null> {
     return dbPromise;
 }
 
-function key(version: string, pageId: number): string {
+/**
+ * Cache key. Originally `{version}/{pageId}` (LOD-less, WebP-only). The
+ * lod and format suffixes were added when the renderer gained multi-LOD
+ * + KTX2 support. Legacy keys (no suffix) remain readable via the
+ * `__webp` / `__0` fallback in getCachedAtlasPage so a first-load after
+ * upgrade doesn't have to re-download the existing WebP cache.
+ */
+function key(version: string, pageId: number, lod = 0, format: 'webp' | 'ktx2' = 'webp'): string {
+    return `${version}/${pageId}/lod${lod}/${format}`;
+}
+
+/** Legacy key format from the pre-LOD era. */
+function legacyKey(version: string, pageId: number): string {
     return `${version}/${pageId}`;
 }
 
@@ -68,7 +80,12 @@ let dbgMisses = 0;
 let dbgStores = 0;
 let dbgStoreFails = 0;
 
-export async function getCachedAtlasPage(version: string, pageId: number): Promise<Blob | null> {
+export async function getCachedAtlasPage(
+    version: string,
+    pageId: number,
+    lod = 0,
+    format: 'webp' | 'ktx2' = 'webp',
+): Promise<Blob | null> {
     const db = await openDB();
     if (!db) {
         if (pageId === 0) console.warn('[atlas-idb] DB unavailable on get');
@@ -77,15 +94,37 @@ export async function getCachedAtlasPage(version: string, pageId: number): Promi
     return new Promise((resolve) => {
         try {
             const tx = db.transaction(STORE, 'readonly');
-            const req = tx.objectStore(STORE).get(key(version, pageId));
+            const store = tx.objectStore(STORE);
+            const req = store.get(key(version, pageId, lod, format));
             req.onsuccess = () => {
                 const val = req.result;
-                const hit = val instanceof Blob;
-                if (hit) dbgHits++; else dbgMisses++;
-                if ((dbgHits + dbgMisses) % 10 === 0) {
-                    console.log(`[atlas-idb] reads so far: ${dbgHits} hits, ${dbgMisses} misses`);
+                if (val instanceof Blob) {
+                    dbgHits++;
+                    if ((dbgHits + dbgMisses) % 10 === 0) {
+                        console.log(`[atlas-idb] reads so far: ${dbgHits} hits, ${dbgMisses} misses`);
+                    }
+                    resolve(val);
+                    return;
                 }
-                resolve(hit ? val : null);
+                // Fall back to legacy key (pre-LOD cache layout) for lod=0 webp
+                // only — that's the only key that could exist before the upgrade.
+                if (lod === 0 && format === 'webp') {
+                    const legacy = store.get(legacyKey(version, pageId));
+                    legacy.onsuccess = () => {
+                        const lv = legacy.result;
+                        if (lv instanceof Blob) {
+                            dbgHits++;
+                            resolve(lv);
+                        } else {
+                            dbgMisses++;
+                            resolve(null);
+                        }
+                    };
+                    legacy.onerror = () => { dbgMisses++; resolve(null); };
+                    return;
+                }
+                dbgMisses++;
+                resolve(null);
             };
             req.onerror = () => {
                 console.warn('[atlas-idb] get error:', req.error);
@@ -98,7 +137,13 @@ export async function getCachedAtlasPage(version: string, pageId: number): Promi
     });
 }
 
-export async function setCachedAtlasPage(version: string, pageId: number, blob: Blob): Promise<void> {
+export async function setCachedAtlasPage(
+    version: string,
+    pageId: number,
+    blob: Blob,
+    lod = 0,
+    format: 'webp' | 'ktx2' = 'webp',
+): Promise<void> {
     const db = await openDB();
     if (!db) {
         if (pageId === 0) console.warn('[atlas-idb] DB unavailable on set');
@@ -107,7 +152,7 @@ export async function setCachedAtlasPage(version: string, pageId: number, blob: 
     return new Promise((resolve) => {
         try {
             const tx = db.transaction(STORE, 'readwrite');
-            tx.objectStore(STORE).put(blob, key(version, pageId));
+            tx.objectStore(STORE).put(blob, key(version, pageId, lod, format));
             tx.oncomplete = () => {
                 dbgStores++;
                 if (dbgStores === 1 || dbgStores % 10 === 0) {

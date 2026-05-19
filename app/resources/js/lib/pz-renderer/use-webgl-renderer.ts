@@ -1,30 +1,49 @@
 /**
- * React hook: initialises the WebGL2 PZ map renderer end-to-end.
+ * React hook that prepares the WebGL2 PZ map renderer.
  *
- * The renderer + atlas array are cached at module level so that navigating
- * away from /admin/players/map and back does NOT re-download/re-upload
- * the ~370 MB atlas — texture stays resident in GPU for the whole session.
+ * Post-refactor pipeline (multi-LOD + lazy pages):
+ *   1. Fetch manifest.json + sprites.json + cell-pages.json (~3 MB total).
+ *   2. Initialise the WebGL context (creates the shared canvas).
+ *   3. Build an AtlasPageManager — no atlas bytes have been fetched yet.
+ *   4. Resolve `ready` immediately. Atlas pages stream in lazily as the
+ *      Leaflet layer requests tiles.
  *
- * Returns null while loading (or on failure). Consumers fall back to the
- * legacy static-tile loader when this returns null.
+ * Total time to "ready" drops from ~20 s (eager-loading 3.4 GB of WebP)
+ * to ~3 s (metadata-only). Initial frames may show progressive sprite
+ * fill — the renderer skips not-yet-resident pages and the layer
+ * invalidates tiles when fresh pages arrive.
  */
 import { useEffect, useRef, useState } from 'react';
-import { fetchAtlasPage, loadAtlasMetadata, type AtlasLoadProgress } from './atlas-loader';
+
+import {
+    buildAtlasPageUrl,
+    loadAtlasMetadata,
+    preloadAllAtlasPages,
+    type AtlasLoadProgress,
+} from './atlas-loader';
+import { AtlasPageManager } from './atlas-page-manager';
 import { clearStaleVersions } from './atlas-idb-cache';
 import { preloadAllChunks } from './cell-chunks';
 import { isWebGL2Available } from './gl/context';
-import { createAtlasArray, uploadAtlasArrayLayer, destroyTexture } from './gl/textures';
 import { PzGLRenderer } from './tile-renderer';
-import type { SpriteIndex } from './types';
+import type { AtlasLodInfo, CellPagesMap, SpriteIndex } from './types';
 
 export interface PzWebGLState {
     renderer: PzGLRenderer | null;
-    /** TEXTURE_2D_ARRAY holding every atlas page as a layer. */
-    atlasTexture: WebGLTexture | null;
+    /** Atlas page residency manager (replaces the single atlasTexture handle). */
+    atlasManager: AtlasPageManager | null;
     spriteIndex: SpriteIndex | null;
+    /** LOD descriptors published by the server. */
+    lods: AtlasLodInfo[] | null;
+    /** cell-pages map; null when the server didn't publish it. */
+    cellPages: CellPagesMap | null;
+    /** Whether sprite UVs are stored as ratios (post-refactor) or absolute pixels (legacy). */
+    uvFormat: 'pixels' | 'normalized';
+    /** Total pages in the atlas. */
+    pageCount: number;
     version: string | null;
     progress: number | null;
-    /** Human-readable label for the current preload phase (atlases / chunks). */
+    /** Human-readable label for the current init phase. */
     progressLabel: string | null;
     error: string | null;
     supported: boolean;
@@ -32,8 +51,12 @@ export interface PzWebGLState {
 
 const INITIAL: PzWebGLState = {
     renderer: null,
-    atlasTexture: null,
+    atlasManager: null,
     spriteIndex: null,
+    lods: null,
+    cellPages: null,
+    uvFormat: 'normalized',
+    pageCount: 0,
     version: null,
     progress: 0,
     progressLabel: 'Подготовка…',
@@ -41,18 +64,19 @@ const INITIAL: PzWebGLState = {
     supported: true,
 };
 
-const ATLAS_SIZE = 4096;
-
 // ---------------------------------------------------------------------------
 // Module-level singleton — survives component unmount/remount.
 // ---------------------------------------------------------------------------
 
 interface ReadyAtlas {
     renderer: PzGLRenderer;
-    atlasTexture: WebGLTexture;
+    atlasManager: AtlasPageManager;
     spriteIndex: SpriteIndex;
+    lods: AtlasLodInfo[];
+    cellPages: CellPagesMap | null;
+    uvFormat: 'pixels' | 'normalized';
+    pageCount: number;
     version: string;
-    /** Hidden canvas backing the GL context — keep alive so context isn't lost. */
     canvas: HTMLCanvasElement;
 }
 
@@ -76,6 +100,12 @@ async function loadOnce(atlasBaseUrl: string, onProgress: AtlasLoadProgress): Pr
             return null;
         }
 
+        const gl = renderer.getGLContext();
+        if (!gl) {
+            console.error('[atlas-singleton] GL context unavailable');
+            return null;
+        }
+
         const meta = await loadAtlasMetadata(atlasBaseUrl, onProgress);
 
         if (meta.pages.length === 0) {
@@ -83,77 +113,37 @@ async function loadOnce(atlasBaseUrl: string, onProgress: AtlasLoadProgress): Pr
             return null;
         }
 
-        const gl = renderer.getGLContext();
-        if (!gl) {
-            console.error('[atlas-singleton] GL context unavailable');
-            return null;
-        }
-
-        const textureArray = createAtlasArray(gl, ATLAS_SIZE, meta.pages.length);
-        const glErr = gl.getError();
-        if (glErr !== gl.NO_ERROR) {
-            console.error(`[atlas-singleton] GL error after texStorage3D: 0x${glErr.toString(16)}`);
-            return null;
-        }
-
-        // Parallel decode + GPU upload via bounded worker pool. GL is the
-        // serial bottleneck (single context), so 12 workers just keep the
-        // decode pipeline saturated so the next bitmap is always ready
-        // when GPU wants the next layer.
-        const CONCURRENCY = 12;
-        const tStart = performance.now();
-        let nextIndex = 0;
-        let completed = 0;
-        let firstError: Error | null = null;
-
-        // Sweep stale-version blobs in the background — non-blocking.
+        // Sweep stale-version blobs in the background.
         void clearStaleVersions(meta.version);
 
-        const worker = async (): Promise<void> => {
-            while (true) {
-                const i = nextIndex++;
-                if (i >= meta.pages.length || firstError) return;
-                const page = meta.pages[i]!;
-                try {
-                    const bitmap = await fetchAtlasPage(page.url, meta.version, page.id);
-                    if (firstError) { bitmap.close(); return; }
-                    uploadAtlasArrayLayer(gl, textureArray, i, bitmap);
-                    const err = gl.getError();
-                    bitmap.close();
-                    if (err !== gl.NO_ERROR) {
-                        firstError = new Error(`GL error 0x${err.toString(16)} uploading page ${i}`);
-                        return;
-                    }
-                } catch (e) {
-                    firstError = e instanceof Error ? e : new Error(String(e));
-                    return;
-                }
-                completed++;
-                if (completed === 1 || completed % 10 === 0 || completed === meta.pages.length) {
-                    const elapsed = ((performance.now() - tStart) / 1000).toFixed(1);
-                    console.log(`[atlas-singleton] uploaded ${completed}/${meta.pages.length} (${elapsed}s)`);
-                }
-                onProgress('atlas', completed, meta.pages.length);
-            }
-        };
+        // Build the lazy page manager. No bytes uploaded yet — the layer
+        // ensures pages as it renders tiles.
+        const atlasManager = new AtlasPageManager({
+            gl,
+            lods: meta.lods,
+            version: meta.version,
+            pageCount: meta.pageCount,
+            baseUrl: atlasBaseUrl,
+            serverHasKtx2: meta.serverHasKtx2,
+            fileTemplate: (lod, pageId, format) => buildAtlasPageUrl(meta.version, pageId, lod, format),
+        });
 
-        await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-
-        if (firstError) {
-            console.error('[atlas-singleton] upload pipeline failed:', firstError);
-            destroyTexture(gl, textureArray);
-            return null;
-        }
+        console.log(
+            `[atlas-singleton] ready — version=${meta.version} pages=${meta.pageCount} lods=${meta.lods.length} ktx2=${atlasManager.pageFormat === 'ktx2'} uv=${meta.uvFormat}`,
+        );
 
         const ready: ReadyAtlas = {
             renderer,
-            atlasTexture: textureArray,
+            atlasManager,
             spriteIndex: meta.sprites,
+            lods: meta.lods,
+            cellPages: meta.cellPages,
+            uvFormat: meta.uvFormat,
+            pageCount: meta.pageCount,
             version: meta.version,
             canvas: glCanvas,
         };
         cachedReady = ready;
-        console.log('[atlas-singleton] READY — cached for the session');
         return ready;
     })();
 
@@ -169,8 +159,12 @@ export function usePzWebGLRenderer(atlasBaseUrl = '/pz-atlas'): PzWebGLState {
         if (cachedReady) {
             return {
                 renderer: cachedReady.renderer,
-                atlasTexture: cachedReady.atlasTexture,
+                atlasManager: cachedReady.atlasManager,
                 spriteIndex: cachedReady.spriteIndex,
+                lods: cachedReady.lods,
+                cellPages: cachedReady.cellPages,
+                uvFormat: cachedReady.uvFormat,
+                pageCount: cachedReady.pageCount,
                 version: cachedReady.version,
                 progress: null,
                 progressLabel: null,
@@ -195,10 +189,7 @@ export function usePzWebGLRenderer(atlasBaseUrl = '/pz-atlas'): PzWebGLState {
 
         if (!isWebGL2Available()) {
             setState({
-                renderer: null,
-                atlasTexture: null,
-                spriteIndex: null,
-                version: null,
+                ...INITIAL,
                 progress: null,
                 progressLabel: null,
                 error: 'WebGL2 is not supported by this browser',
@@ -209,12 +200,12 @@ export function usePzWebGLRenderer(atlasBaseUrl = '/pz-atlas'): PzWebGLState {
 
         let disposed = false;
 
-        // Total budget split: atlases 0–60 %, cell-chunks 60–100 %.
-        const ATLAS_BUDGET = 0.6;
-        // Throttle: re-rendering the React tree on every uploaded page (51×
-        // for atlases, 70× for chunks) blocks the main thread between
-        // uploads and turned a ~3 s load into ~9 s. Coalesce updates to one
-        // every ~100 ms — humans don't perceive the difference.
+        // Progress budget: metadata fetches (5 %) then cell chunks (95 %).
+        // Atlas page preload runs in the background after chunks finish
+        // and is NOT reflected in this bar — its progress is logged to
+        // console only. Mixing it in would keep the overlay visible
+        // while the user can already see the map underneath.
+        const METADATA_BUDGET = 0.05;
         let lastProgressTs = 0;
         const PROGRESS_THROTTLE_MS = 80;
         const pushProgress = (cumulative: number, label: string, force = false): void => {
@@ -226,46 +217,95 @@ export function usePzWebGLRenderer(atlasBaseUrl = '/pz-atlas'): PzWebGLState {
 
         const onProgress: AtlasLoadProgress = (phase, loaded, total) => {
             if (disposed) return;
-            const phaseProgress = total > 0 ? loaded / total : 0;
-            const within =
-                phase === 'manifest' ? phaseProgress * 0.02
-                    : phase === 'sprites' ? 0.02 + phaseProgress * 0.03
-                        : 0.05 + phaseProgress * 0.95;
-            const cumulative = within * ATLAS_BUDGET;
-            const label = phase === 'atlas'
-                ? `Загрузка атласа ${loaded}/${total}`
-                : phase === 'sprites' ? 'Загрузка спрайт-индекса'
-                    : 'Загрузка манифеста атласа';
+            const within = total > 0 ? loaded / total : 0;
+            const cumulative = (() => {
+                if (phase === 'manifest') return within * 0.02;
+                if (phase === 'sprites') return 0.02 + within * 0.02;
+                if (phase === 'cell-pages') return 0.04 + within * 0.01;
+                return within * METADATA_BUDGET;
+            })();
+            const label =
+                phase === 'manifest' ? 'Загрузка манифеста атласа'
+                    : phase === 'sprites' ? 'Загрузка спрайт-индекса'
+                        : phase === 'cell-pages' ? 'Загрузка карты ячеек'
+                            : 'Подготовка…';
             pushProgress(cumulative, label, loaded === total);
+        };
+
+        let lastAtlasLog = 0;
+        const onAtlasPreload = (done: number, total: number): void => {
+            // Background-only progress: keep it OUT of the modal overlay
+            // so the user isn't blocked by a 350 MB download they don't
+            // need to wait for. Log to console every 25 % for sanity.
+            const pct = total > 0 ? done / total : 0;
+            if (done === total || pct - lastAtlasLog >= 0.25) {
+                lastAtlasLog = pct;
+                console.log(`[atlas-preload] ${done}/${total} (${Math.round(pct * 100)}%)`);
+            }
         };
 
         const onChunkProgress = (done: number, total: number): void => {
             if (disposed) return;
             const within = total > 0 ? done / total : 1;
-            const cumulative = ATLAS_BUDGET + within * (1 - ATLAS_BUDGET);
-            pushProgress(cumulative, `Загрузка карты ${done}/${total}`, done === total);
+            const cumulative = METADATA_BUDGET + within * (1 - METADATA_BUDGET);
+            pushProgress(cumulative, `Загрузка геометрии карты ${done}/${total}`, done === total);
         };
 
         loadOnce(atlasBaseUrl, onProgress)
             .then(async (ready) => {
                 if (disposed) return;
                 if (!ready) {
-                    setState((s) => ({ ...s, error: 'atlas load failed', progress: null, progressLabel: null, supported: false }));
+                    setState((s) => ({
+                        ...s,
+                        error: 'atlas load failed',
+                        progress: null,
+                        progressLabel: null,
+                        supported: false,
+                    }));
                     return;
                 }
-                // Atlas done — now warm every cell-data chunk so panning is
-                // immediate (no mid-interaction downloads).
+                // Warm cell-data chunks first so panning is hiccup-free.
+                // This blocks `ready` because the renderer can't draw
+                // anything useful without cells. The chunk LRU caps
+                // in-memory residency separately.
                 try {
                     await preloadAllChunks(onChunkProgress);
                 } catch (err) {
                     console.warn('[atlas-singleton] chunk preload failed:', err);
-                    // Non-fatal: chunks load lazily on demand if preload errored.
                 }
+
+                // Atlas-page preload runs IN THE BACKGROUND. Pages are
+                // lazy-loaded on first use anyway; the eager preload
+                // just trickles every (page × LOD) blob into IDB so
+                // future pans get instant cache hits. Doing it
+                // up-front blocking the map would force the user to
+                // wait ~30 seconds on a fresh visit while ~350 MB
+                // downloads — better to show the map immediately and
+                // let the cache warm asynchronously.
+                const pageList = Array.from(
+                    { length: ready.pageCount },
+                    (_, id) => ({ id }),
+                );
+                void preloadAllAtlasPages(
+                    atlasBaseUrl,
+                    ready.version,
+                    pageList,
+                    ready.lods,
+                    ready.atlasManager.pageFormat,
+                    onAtlasPreload,
+                    /* concurrency */ 4,
+                ).catch((err) => {
+                    console.warn('[atlas-singleton] background atlas preload failed:', err);
+                });
                 if (disposed) return;
                 setState({
                     renderer: ready.renderer,
-                    atlasTexture: ready.atlasTexture,
+                    atlasManager: ready.atlasManager,
                     spriteIndex: ready.spriteIndex,
+                    lods: ready.lods,
+                    cellPages: ready.cellPages,
+                    uvFormat: ready.uvFormat,
+                    pageCount: ready.pageCount,
                     version: ready.version,
                     progress: null,
                     progressLabel: null,
@@ -286,9 +326,8 @@ export function usePzWebGLRenderer(atlasBaseUrl = '/pz-atlas'): PzWebGLState {
 
         return () => {
             disposed = true;
-            // Intentionally NOT calling renderer.dispose() — the renderer is
-            // a session-wide singleton. Disposing it would tear down the
-            // texture array and force a 5-10 s re-upload on the next visit.
+            // Renderer + manager are session-wide singletons; we don't
+            // dispose them on unmount.
         };
     }, [atlasBaseUrl]);
 

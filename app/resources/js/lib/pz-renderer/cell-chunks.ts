@@ -50,11 +50,39 @@ export async function loadChunkIndex(baseUrl = '/pz-cell-data'): Promise<ChunkIn
 }
 
 // ---------------------------------------------------------------------------
-// Chunk fetch — in-flight dedupe + permanent in-memory cache.
+// Chunk fetch — in-flight dedupe + bounded in-memory cache.
+//
+// `chunkBuffers` is an LRU keyed by chunk coord. Capping it prevents the
+// preloadAllChunks() path from pinning the full map (70 × ~5 MB = 350 MB)
+// in JS heap for the lifetime of the session: chunks remain on disk via
+// IndexedDB so a cache miss after eviction is cheap, but the resident
+// working set stays bounded.
 // ---------------------------------------------------------------------------
 
+const CHUNK_LRU_CAPACITY = 24;
 const chunkBuffers = new Map<string, ArrayBuffer>();
 const chunkPromises = new Map<string, Promise<ArrayBuffer | null>>();
+
+function getCachedChunkBuffer(key: string): ArrayBuffer | undefined {
+    const buf = chunkBuffers.get(key);
+    if (!buf) return undefined;
+    // Promote to MRU.
+    chunkBuffers.delete(key);
+    chunkBuffers.set(key, buf);
+    return buf;
+}
+
+function setCachedChunkBuffer(key: string, buf: ArrayBuffer): void {
+    if (chunkBuffers.has(key)) {
+        chunkBuffers.delete(key);
+    } else if (chunkBuffers.size >= CHUNK_LRU_CAPACITY) {
+        const lruKey = chunkBuffers.keys().next().value;
+        if (lruKey !== undefined) {
+            chunkBuffers.delete(lruKey);
+        }
+    }
+    chunkBuffers.set(key, buf);
+}
 
 /**
  * Eagerly download every chunk listed in the index. Used by the page's
@@ -91,7 +119,7 @@ export async function fetchChunkBinary(
     chunkKey: string,
     baseUrl = '/pz-cell-data',
 ): Promise<ArrayBuffer | null> {
-    const cached = chunkBuffers.get(chunkKey);
+    const cached = getCachedChunkBuffer(chunkKey);
     if (cached) return cached;
     const inflight = chunkPromises.get(chunkKey);
     if (inflight) return inflight;
@@ -104,13 +132,13 @@ export async function fetchChunkBinary(
             const version = cachedIndex?.version != null ? String(cachedIndex.version) : 'unknown';
             const idbHit = await getCachedChunk(version, chunkKey);
             if (idbHit) {
-                chunkBuffers.set(chunkKey, idbHit);
+                setCachedChunkBuffer(chunkKey, idbHit);
                 return idbHit;
             }
             const res = await fetch(`${baseUrl}/chunk-${chunkKey}.bin`, { credentials: 'same-origin' });
             if (!res.ok) return null;
             const buf = await res.arrayBuffer();
-            chunkBuffers.set(chunkKey, buf);
+            setCachedChunkBuffer(chunkKey, buf);
             void setCachedChunk(version, chunkKey, buf);
             return buf;
         } catch {

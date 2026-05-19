@@ -71,6 +71,79 @@ describe('pickDivisorAtMost', () => {
     });
 });
 
+describe('block-major iteration step alignment (regression: missing strips)', () => {
+    /**
+     * Mirrors the new block-major loop in _collectInstances. For each
+     * (bx, by) block we compute the first step-aligned LOCAL coordinate
+     * inside the block, then walk `lsx += decimateStep` until blockSize.
+     * The union of all visited world-square coords must EQUAL the set
+     * visited by the simple flat loop `for (wsx=0; wsx<cellEdge; wsx+=step)`.
+     *
+     * If the block-major formula skips any wsx value, the rendered tile
+     * has visible holes (vertical or horizontal stripes), which is exactly
+     * what the original triangle-artefact fix protected against.
+     */
+    function blockMajorVisited(
+        cellEdge: number,
+        blockSize: number,
+        decimateStep: number,
+    ): Set<number> {
+        const visited = new Set<number>();
+        const blocksPerEdge = cellEdge / blockSize;
+        for (let bx = 0; bx < blocksPerEdge; bx++) {
+            const blockOriginX = bx * blockSize;
+            const lsxStart = ((decimateStep - (blockOriginX % decimateStep)) % decimateStep);
+            if (lsxStart >= blockSize) continue;
+            for (let lsx = lsxStart; lsx < blockSize; lsx += decimateStep) {
+                visited.add(blockOriginX + lsx);
+            }
+        }
+        return visited;
+    }
+
+    function flatVisited(cellEdge: number, decimateStep: number): Set<number> {
+        const visited = new Set<number>();
+        for (let w = 0; w < cellEdge; w += decimateStep) { visited.add(w); }
+        return visited;
+    }
+
+    // B42: blockSize=8, cellSizeInBlocks=32 → cellEdge=256
+    // B41: blockSize=10, cellSizeInBlocks=30 → cellEdge=300
+    it.each([
+        [256, 8, 1],
+        [256, 8, 2],
+        [256, 8, 4],
+        [256, 8, 8],
+        [256, 8, 16],
+        [256, 8, 32],
+        [256, 8, 64],
+        [256, 8, 128],
+        [256, 8, 256],
+        [300, 10, 1],
+        [300, 10, 2],
+        [300, 10, 5],
+        [300, 10, 10],
+        [300, 10, 50],
+        [300, 10, 100],
+    ])('cellEdge=%i blockSize=%i step=%i — block-major covers same set as flat loop',
+        (cellEdge, blockSize, decimateStep) => {
+            const blockMajor = blockMajorVisited(cellEdge, blockSize, decimateStep);
+            const flat = flatVisited(cellEdge, decimateStep);
+            expect(blockMajor.size).toBe(flat.size);
+            for (const v of flat) {
+                expect(blockMajor.has(v)).toBe(true);
+            }
+        },
+    );
+
+    it('every visited coord lies on a step-multiple', () => {
+        const visited = blockMajorVisited(256, 8, 16);
+        for (const v of visited) {
+            expect(v % 16).toBe(0);
+        }
+    });
+});
+
 describe('decimation loop edge coverage (regression: bottom-right grey triangles)', () => {
     // Mirrors the iteration in _collectInstances after the fix.
     function lastIteratedSquare(cellEdge: number, decimateStep: number): number {

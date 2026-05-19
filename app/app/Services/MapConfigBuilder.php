@@ -59,6 +59,8 @@ class MapConfigBuilder
                 ? $this->centerFromTileBounds($tileBounds, $maxLevel, $tileSize, $localDzi, $maxLevel)
                 : $this->localDziCenter($localDzi);
 
+            $webglMeta = $this->readAtlasManifest();
+
             return [
                 'tileUrl' => '/map-tiles/{z}/{x}_{y}.jpg',
                 'tileSize' => $tileSize,
@@ -69,6 +71,10 @@ class MapConfigBuilder
                 'dzi' => $localDzi,
                 'useWebGL' => $this->isWebGLAtlasAvailable(),
                 'webGLAtlasUrl' => '/pz-atlas',
+                'webGLLodCount' => $webglMeta['lod_count'],
+                'webGLHasKtx2' => $webglMeta['has_ktx2'],
+                'webGLHasCellPages' => $webglMeta['has_cell_pages'],
+                'webGLCellPagesUrl' => '/pz-atlas/cell-pages.json',
                 'cellsManifestUrl' => '/admin/api/pz-map/cells.json',
             ];
         }
@@ -149,6 +155,32 @@ class MapConfigBuilder
         $manifestPath = rtrim((string) config('zomboid.map.tiles_path', '/map-tiles'), '/').'/web/manifest.json';
 
         return is_file($manifestPath);
+    }
+
+    /**
+     * Read the atlas manifest.json to surface LOD/KTX2 metadata to the
+     * frontend. Returns sane defaults when the manifest is missing or
+     * malformed — the frontend already gracefully degrades to single-LOD.
+     *
+     * @return array{lod_count: int, has_ktx2: bool, has_cell_pages: bool}
+     */
+    private function readAtlasManifest(): array
+    {
+        $defaults = ['lod_count' => 1, 'has_ktx2' => false, 'has_cell_pages' => false];
+        $manifestPath = rtrim((string) config('zomboid.map.tiles_path', '/map-tiles'), '/').'/web/manifest.json';
+        if (! is_file($manifestPath)) {
+            return $defaults;
+        }
+        $data = json_decode((string) file_get_contents($manifestPath), true);
+        if (! is_array($data)) {
+            return $defaults;
+        }
+
+        return [
+            'lod_count' => is_array($data['lods'] ?? null) ? count($data['lods']) : 1,
+            'has_ktx2' => (bool) ($data['has_ktx2'] ?? false),
+            'has_cell_pages' => (bool) ($data['has_cell_pages'] ?? false),
+        ];
     }
 
     /**

@@ -116,6 +116,14 @@ export function createTileBuffers(
     return { vao, quadVBO, instanceVBO, instanceCapacity: initialInstanceCapacity };
 }
 
+/** Buffer never shrinks below this many instances. */
+const MIN_INSTANCE_CAPACITY = 8192;
+/** Number of consecutive low-occupancy uploads before we reallocate smaller. */
+const SHRINK_HYSTERESIS = 64;
+
+/** Internal counter — how many uploads in a row stayed under capacity/4. */
+let lowOccupancyStreak = 0;
+
 export function uploadInstanceData(
     gl: WebGL2RenderingContext,
     buffers: TileBuffers,
@@ -128,6 +136,27 @@ export function uploadInstanceData(
         const newCapacity = Math.max(instanceCount, buffers.instanceCapacity * 2);
         gl.bufferData(gl.ARRAY_BUFFER, newCapacity * INSTANCE_STRIDE_BYTES, gl.DYNAMIC_DRAW);
         buffers.instanceCapacity = newCapacity;
+        lowOccupancyStreak = 0;
+    } else if (
+        buffers.instanceCapacity > MIN_INSTANCE_CAPACITY
+        && instanceCount < (buffers.instanceCapacity >> 2)
+    ) {
+        // GPU VBO is at least 4× larger than current need. Wait for a
+        // sustained low-occupancy streak before shrinking — pan-zoom across
+        // a dense block back to an empty one shouldn't trigger a realloc
+        // every render. After SHRINK_HYSTERESIS small uploads in a row,
+        // reallocate down to 2× the most recent count (keep headroom).
+        lowOccupancyStreak++;
+        if (lowOccupancyStreak >= SHRINK_HYSTERESIS) {
+            const target = Math.max(MIN_INSTANCE_CAPACITY, instanceCount * 2);
+            if (target < buffers.instanceCapacity) {
+                gl.bufferData(gl.ARRAY_BUFFER, target * INSTANCE_STRIDE_BYTES, gl.DYNAMIC_DRAW);
+                buffers.instanceCapacity = target;
+            }
+            lowOccupancyStreak = 0;
+        }
+    } else {
+        lowOccupancyStreak = 0;
     }
 
     gl.bufferSubData(

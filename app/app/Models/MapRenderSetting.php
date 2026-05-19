@@ -25,6 +25,10 @@ class MapRenderSetting extends Model
         'atlas_size_bytes',
         'atlas_sprite_count',
         'atlas_page_count',
+        'atlas_lod_count',
+        'atlas_has_ktx2',
+        'atlas_compression_format',
+        'cell_pages_built_at',
     ];
 
     protected function casts(): array
@@ -40,6 +44,9 @@ class MapRenderSetting extends Model
             'atlas_size_bytes' => 'integer',
             'atlas_sprite_count' => 'integer',
             'atlas_page_count' => 'integer',
+            'atlas_lod_count' => 'integer',
+            'atlas_has_ktx2' => 'boolean',
+            'cell_pages_built_at' => 'datetime',
         ];
     }
 
