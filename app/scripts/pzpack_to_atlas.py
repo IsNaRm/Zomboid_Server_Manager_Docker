@@ -553,31 +553,37 @@ def build_cell_pages_map(cell_data_dir: Path, sprite_records: dict) -> dict[str,
 def parse_lotheader_sprite_names(path: Path) -> list[str]:
     """Minimal lotheader parser — extracts the sprite_names list only.
 
-    Binary layout (B41/B42 share this prefix):
-        uint32_le version
-        uint32_le tile_count          ← number of sprite names
-        repeat tile_count:
-            uint32_le name_length
-            <name_length> ASCII bytes
-        (header continues with rooms / buildings / zpop — we don't read those)
+    Binary layout (mirror of frontend `parsers/lotheader.ts`):
+        4 bytes "LOTH" magic  (optional; absent on legacy B41 files)
+        uint32_le version (0=B41, 1=B42)         ← only when magic present
+        uint32_le tile_count
+        tile_count × newline-terminated UTF-8 strings   ← NOT length-prefixed
+        (header continues with width/height/layer/rooms/buildings/zpop;
+         we don't read past the names list.)
     """
     with path.open('rb') as fh:
         raw = fh.read()
     if len(raw) < 8:
         return []
     pos = 0
-    _version = struct.unpack_from('<I', raw, pos)[0]; pos += 4
-    tile_count = struct.unpack_from('<I', raw, pos)[0]; pos += 4
+    # Check for "LOTH" magic; if present, skip it + version. Legacy B41
+    # files lack the magic so we start straight at tile_count.
+    if raw[0:4] == b'LOTH':
+        pos += 4  # magic
+        pos += 4  # version uint32
+    if pos + 4 > len(raw):
+        return []
+    tile_count = struct.unpack_from('<I', raw, pos)[0]
+    pos += 4
     names: list[str] = []
     for _ in range(tile_count):
-        if pos + 4 > len(raw):
+        # Read until newline (0x0A). Strings are UTF-8 in practice ASCII.
+        end = raw.find(b'\n', pos)
+        if end < 0 or end > len(raw):
             break
-        name_len = struct.unpack_from('<I', raw, pos)[0]; pos += 4
-        if pos + name_len > len(raw):
-            break
-        name = raw[pos:pos + name_len].decode('ascii', errors='replace')
+        name = raw[pos:end].decode('utf-8', errors='replace').strip()
         names.append(name)
-        pos += name_len
+        pos = end + 1
     return names
 
 

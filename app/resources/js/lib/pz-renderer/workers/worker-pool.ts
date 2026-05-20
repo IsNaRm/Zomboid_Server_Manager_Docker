@@ -1,235 +1,144 @@
 /**
- * Round-robin Web Worker pool for PZ binary parsing.
+ * Worker pool для cell binary parsing.
  *
- * Maintains 4 worker instances. Dispatches jobs via round-robin with an
- * internal queue if all workers are busy. Each job's Promise resolves when
- * the worker posts back its response.
+ * Stateless workers — input → output, без retained кэшей. Round-robin
+ * диспатч между N воркерами (N = min(hardwareConcurrency, 8)).
  *
- * Usage:
- *   import { workerPool } from './worker-pool';
+ * Используется только в init phase. После init вызывают `terminate()`,
+ * воркеры освобождаются.
  *
- *   const header = await workerPool.parseLotheader(buffer, 30, 30);
- *   const lotpack = await workerPool.parseLotpack(buffer, header);
- *
- * Note: The `?worker` Vite import syntax creates a new Worker instance
- * via Vite's built-in worker bundling. Worker threads share no memory
- * with the main thread except for transferred ArrayBuffers.
+ * Sprite name → id mapping транслируется в каждый worker одноразово
+ * через init message.
  */
 
-import {
-    type CellMetadata,
-    type LotpackData,
-    type SaveGameData,
-    type WorkerCommand,
-    type WorkerMessage,
-    type WorkerRequest,
+// eslint-disable-next-line import/no-unresolved
+import PzCellParserWorker from './pz-cell-parser.worker.ts?worker';
+
+import type {
+    WorkerErrorResponse,
+    WorkerMessageOut,
+    WorkerParseMessage,
+    WorkerParseResponse,
 } from '../types';
 
-// ---------------------------------------------------------------------------
-// Vite worker import
-// ---------------------------------------------------------------------------
-
-// Using Vite ?worker syntax — bundled as a separate chunk
-// eslint-disable-next-line import/no-unresolved
-import PzBinaryWorker from './pz-binary-worker?worker';
-
-// ---------------------------------------------------------------------------
-// Pool implementation
-// ---------------------------------------------------------------------------
-
-const POOL_SIZE = 4;
-
-interface PendingJob {
-    resolve: (value: WorkerMessage) => void;
-    reject: (reason: Error) => void;
+interface PendingTask {
+    resolve: (resp: WorkerParseResponse) => void;
+    reject: (err: Error) => void;
 }
 
 interface WorkerSlot {
     worker: Worker;
-    /** Jobs currently in-flight keyed by request ID. */
-    pending: Map<number, PendingJob>;
+    pending: Map<number, PendingTask>;
 }
 
-let nextId = 1;
-
-function createWorkerSlot(): WorkerSlot {
-    const worker = new PzBinaryWorker() as Worker;
-    const pending: Map<number, PendingJob> = new Map();
-
-    worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
-        const msg = event.data;
-        const job = pending.get(msg.id);
-        if (!job) return;
-        pending.delete(msg.id);
-        job.resolve(msg);
-        // Drain queue for this slot
-        drainQueue(slot);
-    };
-
-    worker.onerror = (ev: ErrorEvent) => {
-        // Reject all pending jobs on this worker
-        const error = new Error(`[worker-pool] Worker error: ${ev.message}`);
-        for (const job of pending.values()) {
-            job.reject(error);
-        }
-        pending.clear();
-    };
-
-    const slot: WorkerSlot = { worker, pending };
-    return slot;
-}
-
-// ---------------------------------------------------------------------------
-// Queue
-// ---------------------------------------------------------------------------
-
-interface QueuedJob {
-    request: WorkerRequest;
-    resolve: (value: WorkerMessage) => void;
-    reject: (reason: Error) => void;
-}
-
-const jobQueue: QueuedJob[] = [];
-
-function drainQueue(slot: WorkerSlot): void {
-    if (jobQueue.length === 0) return;
-    const queued = jobQueue.shift();
-    if (!queued) return;
-    dispatchToSlot(slot, queued.request, queued.resolve, queued.reject);
-}
-
-function dispatchToSlot(
-    slot: WorkerSlot,
-    request: WorkerRequest,
-    resolve: (value: WorkerMessage) => void,
-    reject: (reason: Error) => void,
-): void {
-    slot.pending.set(request.id, { resolve, reject });
-    // Transfer the ArrayBuffer to avoid copying
-    slot.worker.postMessage(request, [request.buffer]);
-}
-
-// ---------------------------------------------------------------------------
-// Pool singleton
-// ---------------------------------------------------------------------------
+const DEFAULT_POOL_SIZE = (() => {
+    if (typeof navigator === 'undefined' || !navigator.hardwareConcurrency) {
+        return 4;
+    }
+    return Math.max(2, Math.min(8, navigator.hardwareConcurrency));
+})();
 
 export class WorkerPool {
     private readonly slots: WorkerSlot[];
-    private nextSlot: number = 0;
+    private nextTaskId = 1;
+    private nextSlotIdx = 0;
+    private disposed = false;
 
-    constructor(size: number) {
-        this.slots = Array.from({ length: size }, () => createWorkerSlot());
+    constructor(size: number = DEFAULT_POOL_SIZE) {
+        this.slots = Array.from({ length: size }, () => this.createSlot());
     }
 
-    private dispatch(request: WorkerRequest): Promise<WorkerMessage> {
-        return new Promise<WorkerMessage>((resolve, reject) => {
-            // Round-robin slot selection
-            const slot = this.slots[this.nextSlot % this.slots.length];
-            this.nextSlot = (this.nextSlot + 1) % this.slots.length;
-
-            if (!slot) {
-                reject(new Error('[worker-pool] No slots available'));
-                return;
-            }
-
-            // If the selected slot is busy, queue it
-            // (In practice workers can handle multiple messages, but we
-            //  check if there are already pending jobs to decide on queue)
-            dispatchToSlot(slot, request, resolve, reject);
-        });
-    }
-
-    /**
-     * Parse a .lotheader buffer off-main-thread.
-     *
-     * @param buffer  Raw bytes. Will be transferred (zero-copy).
-     * @param cellX   Cell X coordinate.
-     * @param cellY   Cell Y coordinate.
-     */
-    async parseLotheader(buffer: ArrayBuffer, cellX: number, cellY: number): Promise<CellMetadata> {
-        const request: WorkerRequest = {
-            id: nextId++,
-            command: 'parseLotheader' as WorkerCommand,
-            x: cellX,
-            y: cellY,
-            buffer,
-        };
-
-        const response = await this.dispatch(request);
-        if (!response.ok) {
-            throw new Error(`[worker-pool] parseLotheader failed: ${response.error}`);
-        }
-        return response.result as CellMetadata;
-    }
-
-    /**
-     * Parse a .lotpack buffer off-main-thread.
-     *
-     * @param buffer  Raw bytes. Will be transferred (zero-copy).
-     * @param header  Already-parsed CellMetadata (sent by value, not transferred).
-     */
-    async parseLotpack(buffer: ArrayBuffer, header: CellMetadata): Promise<LotpackData> {
-        const request: WorkerRequest = {
-            id: nextId++,
-            command: 'parseLotpack' as WorkerCommand,
-            x: header.cellX,
-            y: header.cellY,
-            buffer,
-            header,
-        };
-
-        const response = await this.dispatch(request);
-        if (!response.ok) {
-            throw new Error(`[worker-pool] parseLotpack failed: ${response.error}`);
-        }
-        return response.result as LotpackData;
-    }
-
-    /**
-     * Parse a save-game cell binary off-main-thread.
-     *
-     * @param buffer  Raw bytes. Will be transferred.
-     * @param cellX   Cell X.
-     * @param cellY   Cell Y.
-     */
-    async parseSavegame(buffer: ArrayBuffer, cellX: number, cellY: number): Promise<SaveGameData> {
-        const request: WorkerRequest = {
-            id: nextId++,
-            command: 'parseSavegame' as WorkerCommand,
-            x: cellX,
-            y: cellY,
-            buffer,
-        };
-
-        const response = await this.dispatch(request);
-        if (!response.ok) {
-            throw new Error(`[worker-pool] parseSavegame failed: ${response.error}`);
-        }
-        return response.result as SaveGameData;
-    }
-
-    /** Number of workers in the pool. */
     get size(): number {
         return this.slots.length;
     }
 
-    /** Total in-flight jobs across all workers. */
-    get inFlight(): number {
-        return this.slots.reduce((acc, s) => acc + s.pending.size, 0);
-    }
-
-    /** Number of queued jobs waiting for a free worker slot. */
-    get queued(): number {
-        return jobQueue.length;
-    }
-
-    /** Terminate all workers (e.g. on page unload). */
-    terminate(): void {
+    /**
+     * Транслирует sprite name → id mapping в каждый worker. Должно быть
+     * вызвано ОДИН РАЗ перед любым `parseCell`.
+     */
+    initSpriteIndex(spriteNameToId: Map<string, number>): void {
+        const payload = Array.from(spriteNameToId.entries());
         for (const slot of this.slots) {
+            slot.worker.postMessage({
+                type: 'init',
+                spriteNameToId: payload,
+            });
+        }
+    }
+
+    /**
+     * Парсит одну cell. Round-robin worker selection. ArrayBuffer'ы
+     * передаются через transferable (zero-copy).
+     */
+    parseCell(
+        cellX: number,
+        cellY: number,
+        headerBuf: ArrayBuffer,
+        lotpackBuf: ArrayBuffer,
+    ): Promise<WorkerParseResponse> {
+        if (this.disposed) {
+            return Promise.reject(new Error('[worker-pool] disposed'));
+        }
+        return new Promise((resolve, reject) => {
+            const slot = this.slots[this.nextSlotIdx % this.slots.length]!;
+            this.nextSlotIdx++;
+            const taskId = this.nextTaskId++;
+            slot.pending.set(taskId, { resolve, reject });
+            const msg: WorkerParseMessage = {
+                type: 'parse',
+                taskId,
+                cellX,
+                cellY,
+                headerBuf,
+                lotpackBuf,
+            };
+            slot.worker.postMessage(msg, [headerBuf, lotpackBuf]);
+        });
+    }
+
+    /** Освободить всех воркеров. После dispose pool неюзабелен. */
+    dispose(): void {
+        if (this.disposed) return;
+        this.disposed = true;
+        for (const slot of this.slots) {
+            const err = new Error('[worker-pool] disposed before completion');
+            for (const task of slot.pending.values()) {
+                task.reject(err);
+            }
+            slot.pending.clear();
             slot.worker.terminate();
         }
     }
-}
 
-/** Singleton worker pool — 4 workers, shared across all map components. */
-export const workerPool = new WorkerPool(POOL_SIZE);
+    private createSlot(): WorkerSlot {
+        const worker = new PzCellParserWorker() as Worker;
+        const pending = new Map<number, PendingTask>();
+
+        worker.onmessage = (ev: MessageEvent<WorkerMessageOut>) => {
+            const msg = ev.data;
+            if (msg.type === 'parse-result') {
+                const task = pending.get(msg.taskId);
+                if (task) {
+                    pending.delete(msg.taskId);
+                    task.resolve(msg);
+                }
+            } else if (msg.type === 'error') {
+                const task = pending.get(msg.taskId);
+                if (task) {
+                    pending.delete(msg.taskId);
+                    task.reject(new Error(msg.error));
+                }
+            }
+        };
+
+        worker.onerror = (ev) => {
+            const err = new Error(`[worker-pool] worker error: ${ev.message}`);
+            for (const task of pending.values()) {
+                task.reject(err);
+            }
+            pending.clear();
+        };
+
+        return { worker, pending };
+    }
+}
