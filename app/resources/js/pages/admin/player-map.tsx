@@ -85,14 +85,7 @@ export default function PlayerMap({ markers, onlineCount, serverStatus, mapConfi
         <AppLayout breadcrumbs={breadcrumbs}>
             <Head title={t('admin.player_map.title')} />
             <div className="relative flex flex-1 flex-col">
-                {/* Floating header overlay so the map can occupy the full pane */}
-                <div className="pointer-events-none absolute top-3 left-3 right-3 z-[1000] flex flex-wrap items-start justify-between gap-3">
-                    <div className="pointer-events-auto rounded-lg bg-background/85 px-3 py-2 shadow-sm backdrop-blur-sm">
-                        <h1 className="text-base font-semibold tracking-tight">{t('admin.player_map.title')}</h1>
-                        <p className="text-xs text-muted-foreground">
-                            {t('admin.player_map.players_tracked', { count: String(counts.total) })}
-                        </p>
-                    </div>
+                <div className="pointer-events-none absolute top-3 right-3 z-[1000] flex flex-wrap items-start justify-end gap-3">
                     <div className="pointer-events-auto flex flex-wrap items-center gap-2 rounded-lg bg-background/85 px-2 py-1.5 shadow-sm backdrop-blur-sm">
                         <Badge variant="outline" className="text-xs">
                             <Circle className="mr-1.5 size-2 fill-green-500 text-green-500" />

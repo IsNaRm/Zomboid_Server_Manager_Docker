@@ -10,11 +10,13 @@
  * Phase 4+ добавит Leaflet интеграцию для полного map view.
  */
 
+import { BarChart3, Settings } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { PzMapError } from './pz-map-error';
 import { PzMapPreloader } from './pz-map-preloader';
 import { useMapRenderer } from '@/hooks/use-map-renderer';
+import { useTranslation } from '@/hooks/use-translation';
 import type { PzMapRenderer } from '@/lib/pz-renderer';
 
 export interface PzMapViewProps {
@@ -31,13 +33,16 @@ export function PzMapView({
     cellsBaseUrl,
 }: PzMapViewProps) {
     const canvasRef = useRef<HTMLCanvasElement>(null);
+    const { t } = useTranslation();
+    const [showControls, setShowControls] = useState(false);
+    const [showStats, setShowStats] = useState(false);
     const { renderer, progress, error, isReady, cancel } = useMapRenderer({
         canvasRef,
         atlasBaseUrl,
         cellsBaseUrl,
     });
 
-    const [mode, setMode] = useState<DebugMode>('atlas');
+    const [mode, setMode] = useState<DebugMode>('cell');
     const [atlasLod, setAtlasLod] = useState(0);
     const [atlasPage, setAtlasPage] = useState(0);
     const [atlasBrightness, setAtlasBrightness] = useState(1.0);
@@ -275,8 +280,37 @@ export function PzMapView({
             {showPreloader && <PzMapPreloader progress={progress} onCancel={cancel} />}
             {error && <PzMapError error={error} />}
             {isReady && (
-                <>
-                    <DebugControls
+                <div className="absolute left-3 top-3 z-[900] flex max-h-[calc(100vh-1.5rem)] flex-col gap-2">
+                    {/* Toggle bar */}
+                    <div className="flex gap-1">
+                        <button
+                            type="button"
+                            onClick={() => setShowControls((v) => !v)}
+                            title={t('admin.pz_map.toggle_controls')}
+                            className={`rounded border p-2 transition ${
+                                showControls
+                                    ? 'border-emerald-600 bg-emerald-700/30 text-emerald-300'
+                                    : 'border-zinc-700 bg-zinc-900/80 text-zinc-400 hover:bg-zinc-800'
+                            }`}
+                        >
+                            <Settings className="h-4 w-4" />
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setShowStats((v) => !v)}
+                            title={t('admin.pz_map.toggle_stats')}
+                            className={`rounded border p-2 transition ${
+                                showStats
+                                    ? 'border-cyan-600 bg-cyan-700/30 text-cyan-300'
+                                    : 'border-zinc-700 bg-zinc-900/80 text-zinc-400 hover:bg-zinc-800'
+                            }`}
+                        >
+                            <BarChart3 className="h-4 w-4" />
+                        </button>
+                    </div>
+                    {showControls && (
+                        <div className="overflow-y-auto">
+                            <DebugControls
                         mode={mode}
                         setMode={setMode}
                         atlasLod={atlasLod}
@@ -321,9 +355,11 @@ export function PzMapView({
                         findNonEmpty={findNonEmpty}
                         fragDebug={fragDebug}
                         setFragDebug={setFragDebug}
-                    />
-                    <CellStatsHud renderer={renderer} />
-                </>
+                            />
+                        </div>
+                    )}
+                    {showStats && <CellStatsHud renderer={renderer} />}
+                </div>
             )}
         </div>
     );
@@ -374,75 +410,14 @@ interface DebugControlsProps {
 }
 
 function DebugControls(p: DebugControlsProps) {
+    const { t } = useTranslation();
     return (
-        <div className="absolute right-3 top-3 z-[900] w-80 space-y-3 rounded-md border border-zinc-700 bg-zinc-900/90 p-3 text-xs text-zinc-200 backdrop-blur">
-            <div className="flex gap-2">
-                <ModeButton
-                    active={p.mode === 'atlas'}
-                    onClick={() => p.setMode('atlas')}
-                >
-                    Atlas viewer
-                </ModeButton>
-                <ModeButton
-                    active={p.mode === 'cell'}
-                    onClick={() => p.setMode('cell')}
-                >
-                    Cell render
-                </ModeButton>
-            </div>
-
-            {p.mode === 'atlas' && (
-                <>
-                    <Slider
-                        label="LOD"
-                        value={p.atlasLod}
-                        min={0}
-                        max={p.lodCount - 1}
-                        onChange={p.setAtlasLod}
-                    />
-                    <Slider
-                        label="Page"
-                        value={p.atlasPage}
-                        min={0}
-                        max={p.pageCount - 1}
-                        onChange={p.setAtlasPage}
-                        valueFmt={(v) => `${v} / ${p.pageCount - 1}`}
-                    />
-                    <Slider
-                        label="Brightness"
-                        value={p.atlasBrightness}
-                        min={0.5}
-                        max={4}
-                        step={0.1}
-                        onChange={p.setAtlasBrightness}
-                        valueFmt={(v) => `${v.toFixed(1)}×`}
-                    />
-                </>
-            )}
-
+        <div className="w-80 space-y-3 rounded-md border border-zinc-700 bg-zinc-900/90 p-3 text-xs text-zinc-200 backdrop-blur">
             {p.mode === 'cell' && (
                 <>
-                    {p.cellRange && (
-                        <>
-                            <CellCoordRow
-                                label="Cell X"
-                                value={p.cellX}
-                                min={p.cellRange.minX}
-                                max={p.cellRange.maxX}
-                                onChange={p.setCellX}
-                            />
-                            <CellCoordRow
-                                label="Cell Y"
-                                value={p.cellY}
-                                min={p.cellRange.minY}
-                                max={p.cellRange.maxY}
-                                onChange={p.setCellY}
-                            />
-                        </>
-                    )}
                     <div className="flex items-center justify-between gap-2 text-[10px] text-zinc-400">
                         <span>
-                            Entries:{' '}
+                            {t('admin.pz_map.sprite_entries')}:{' '}
                             <span className="font-mono text-emerald-400">
                                 {p.entryCount.toLocaleString()}
                             </span>
@@ -451,37 +426,12 @@ function DebugControls(p: DebugControlsProps) {
                             onClick={() => p.findNonEmpty()}
                             className="rounded bg-emerald-700 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-emerald-600"
                         >
-                            Find non-empty →
+                            {t('admin.pz_map.find_non_empty')}
                         </button>
-                    </div>
-                    <div className="space-y-1 border-t border-zinc-800 pt-2">
-                        <p className="text-[10px] uppercase tracking-wider text-amber-400">
-                            Fragment debug
-                        </p>
-                        <div className="flex gap-1">
-                            {(['Normal', 'Magenta', 'UV viz'] as const).map((label, idx) => (
-                                <button
-                                    key={label}
-                                    onClick={() => p.setFragDebug?.(idx)}
-                                    className={`flex-1 rounded px-2 py-1 text-[10px] transition ${
-                                        p.fragDebug === idx
-                                            ? 'bg-amber-700 text-white'
-                                            : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'
-                                    }`}
-                                >
-                                    {label}
-                                </button>
-                            ))}
-                        </div>
-                        <p className="text-[9px] text-zinc-500">
-                            Magenta = quads видны → проекция OK. UV = градиент
-                            каждого спрайта → UV декод OK.
-                        </p>
                     </div>
                     {p.entryCount === 0 && (
                         <p className="text-[10px] text-amber-400">
-                            Cell пустая. Двигай слайдер X/Y, вводи число в input,
-                            или жми «Find non-empty».
+                            {t('admin.pz_map.cell_empty')}
                         </p>
                     )}
                     <div className="space-y-1 border-t border-zinc-800 pt-2">
@@ -491,12 +441,13 @@ function DebugControls(p: DebugControlsProps) {
                                 checked={p.autoTuning}
                                 onChange={(e) => p.setAutoTuning(e.target.checked)}
                             />
-                            <span>Auto LOD / stride</span>
+                            <span>{t('admin.pz_map.auto_lod_stride')}</span>
                         </label>
                         {p.autoTuning ? (
                             <div className="flex justify-between font-mono text-[10px] text-zinc-400">
                                 <span>
-                                    level <span className="text-cyan-400">{p.tuning.level}</span>
+                                    {t('admin.pz_map.level')}{' '}
+                                    <span className="text-cyan-400">{p.tuning.level}</span>
                                 </span>
                                 <span>
                                     cs<span className="text-emerald-400">{p.tuning.cellStride}</span>{' '}
@@ -507,22 +458,14 @@ function DebugControls(p: DebugControlsProps) {
                         ) : (
                             <>
                                 <Slider
-                                    label="LOD"
+                                    label={t('admin.pz_map.cell_lod')}
                                     value={p.cellLod}
                                     min={0}
                                     max={p.lodCount - 1}
                                     onChange={p.setCellLod}
                                 />
                                 <Slider
-                                    label="cellStride"
-                                    value={p.manualCellStride}
-                                    min={1}
-                                    max={16}
-                                    step={1}
-                                    onChange={p.setManualCellStride}
-                                />
-                                <Slider
-                                    label="squareStride"
+                                    label={t('admin.pz_map.square_stride')}
                                     value={p.manualSquareStride}
                                     min={1}
                                     max={12}
@@ -539,16 +482,8 @@ function DebugControls(p: DebugControlsProps) {
                             </>
                         )}
                     </div>
-                    <label className="flex cursor-pointer items-center gap-2 text-xs">
-                        <input
-                            type="checkbox"
-                            checked={p.isometric}
-                            onChange={(e) => p.setIsometric(e.target.checked)}
-                        />
-                        <span>Isometric projection</span>
-                    </label>
                     <Slider
-                        label="sqr (px/sq)"
+                        label={t('admin.pz_map.sqr')}
                         value={p.sqr}
                         min={8}
                         max={256}
@@ -556,7 +491,7 @@ function DebugControls(p: DebugControlsProps) {
                         onChange={p.setSqr}
                     />
                     <Slider
-                        label="zoom (pps mult)"
+                        label={t('admin.pz_map.zoom')}
                         value={p.pps}
                         min={0.001}
                         max={8}
@@ -568,35 +503,21 @@ function DebugControls(p: DebugControlsProps) {
                     />
                     <div className="space-y-1 border-t border-zinc-800 pt-2">
                         <Slider
-                            label="Max floor"
+                            label={t('admin.pz_map.max_floor')}
                             value={p.maxFloor}
                             min={0}
                             max={3}
                             step={1}
                             onChange={p.setMaxFloor}
                             valueFmt={(v) =>
-                                v === 0 ? 'ground only' : `0..${v}`
+                                v === 0 ? t('admin.pz_map.ground_only') : `0..${v}`
                             }
                         />
-                        <Slider
-                            label="Floor height (px)"
-                            value={p.floorHeightPx}
-                            min={0}
-                            max={400}
-                            step={4}
-                            onChange={p.setFloorHeightPx}
-                            valueFmt={(v) => `${v} px`}
-                        />
-                        <p className="text-[9px] text-zinc-500">
-                            Если этажи накладываются на нижние — крути floor
-                            height. PZ B42 стандарт = 192 (pzmap2dzi
-                            LAYER_HEIGHT). 0 = все этажи на ground (debug).
-                        </p>
                     </div>
                     <div className="space-y-1 border-t border-zinc-800 pt-2">
                         <div className="flex items-center justify-between gap-2 text-[10px] text-zinc-400">
                             <span>
-                                Pan:{' '}
+                                {t('admin.pz_map.pan_label')}:{' '}
                                 <span className="font-mono text-cyan-400">
                                     {Math.round(p.panX)}, {Math.round(p.panY)}
                                 </span>
@@ -605,11 +526,11 @@ function DebugControls(p: DebugControlsProps) {
                                 onClick={p.resetPan}
                                 className="rounded bg-cyan-700 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-cyan-600"
                             >
-                                Reset pan
+                                {t('admin.pz_map.reset_pan')}
                             </button>
                         </div>
                         <p className="text-[9px] text-zinc-500">
-                            Зажми ЛКМ на canvas и тащи чтобы перемещаться.
+                            {t('admin.pz_map.pan_hint')}
                         </p>
                     </div>
                 </>
@@ -728,6 +649,7 @@ function CellCoordRow({ label, value, min, max, onChange }: CellCoordRowProps) {
 }
 
 function CellStatsHud({ renderer }: { renderer: PzMapRenderer | null }) {
+    const { t } = useTranslation();
     const stats = renderer?.getCellStats();
     const texInfo = renderer?.getCellTextureInfo();
     const [drawnCells, setDrawnCells] = useState(0);
@@ -770,56 +692,56 @@ function CellStatsHud({ renderer }: { renderer: PzMapRenderer | null }) {
     const fpsColor = fps >= 50 ? 'text-emerald-400' : fps >= 30 ? 'text-amber-400' : 'text-red-400';
 
     return (
-        <div className="absolute bottom-3 left-3 z-[900] w-72 space-y-1 rounded-md border border-zinc-700 bg-zinc-900/90 p-3 font-mono text-[10px] text-zinc-300 backdrop-blur">
+        <div className="w-72 space-y-1 rounded-md border border-zinc-700 bg-zinc-900/90 p-3 font-mono text-[10px] text-zinc-300 backdrop-blur">
             <p className="text-[10px] uppercase tracking-wider text-emerald-400">
-                Phase 5 — instance-driven auto stride
+                {t('admin.pz_map.phase_label')}
             </p>
             <div className="flex justify-between">
-                <span>FPS</span>
+                <span>{t('admin.pz_map.fps')}</span>
                 <span className={fpsColor}>{fps}</span>
             </div>
             <div className="flex justify-between">
-                <span>Cells / instances drawn</span>
+                <span>{t('admin.pz_map.cells_in_viewport')}</span>
                 <span className="text-cyan-400">
                     {drawnCells} / {drawnInstances.toLocaleString()}
                 </span>
             </div>
             <div className="flex justify-between">
-                <span>render K (stride 2^K)</span>
+                <span>{t('admin.pz_map.render_k')}</span>
                 <span className="text-amber-400">
                     {renderK} (2^{renderK} = {1 << renderK})
                 </span>
             </div>
             <div className="flex justify-between">
-                <span>Cells parsed</span>
+                <span>{t('admin.pz_map.cells_parsed')}</span>
                 <span>
                     {stats.parsedCells} / {stats.totalCells}
                 </span>
             </div>
             <div className="flex justify-between">
-                <span>Cells skipped</span>
+                <span>{t('admin.pz_map.cells_skipped')}</span>
                 <span>{stats.skippedCells}</span>
             </div>
             <div className="flex justify-between">
-                <span>Sprite entries</span>
+                <span>{t('admin.pz_map.sprite_entries')}</span>
                 <span>{texInfo.totalEntries.toLocaleString()}</span>
             </div>
             <div className="flex justify-between">
-                <span>cellAtlas size</span>
+                <span>{t('admin.pz_map.atlas_size')}</span>
                 <span>{mbAtlas.toFixed(1)} MB</span>
             </div>
             <div className="flex justify-between">
-                <span>IDB cache hit</span>
+                <span>{t('admin.pz_map.idb_cache_hit')}</span>
                 <span>{(cacheRatio * 100).toFixed(0)}%</span>
             </div>
             <div className="flex justify-between text-zinc-500">
-                <span>Origin</span>
+                <span>{t('admin.pz_map.origin')}</span>
                 <span>
                     ({texInfo.originCellX}, {texInfo.originCellY})
                 </span>
             </div>
             <div className="flex justify-between text-zinc-500">
-                <span>Grid</span>
+                <span>{t('admin.pz_map.grid')}</span>
                 <span>
                     {texInfo.indexGridWidth} × {texInfo.indexGridHeight}
                 </span>

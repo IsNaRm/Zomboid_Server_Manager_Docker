@@ -128,10 +128,10 @@ export class PzMapRenderer {
         this.opts = opts;
         this.progress = new ProgressAggregator(
             [
-                { name: 'manifests', weight: 0.05, label: 'Загрузка манифестов' },
-                { name: 'atlas', weight: 0.40, label: 'Загрузка атласа' },
-                { name: 'cells', weight: 0.50, label: 'Загрузка карты' },
-                { name: 'finalize', weight: 0.05, label: 'Подготовка GPU' },
+                { name: 'manifests', weight: 0.05, label: 'admin.pz_map.phase.manifests' },
+                { name: 'atlas', weight: 0.40, label: 'admin.pz_map.phase.atlas' },
+                { name: 'cells', weight: 0.50, label: 'admin.pz_map.phase.cells' },
+                { name: 'finalize', weight: 0.05, label: 'admin.pz_map.phase.finalize' },
             ],
             (snapshot) => this.opts.onProgress?.(snapshot),
             100,

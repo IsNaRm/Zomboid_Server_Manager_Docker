@@ -78,7 +78,7 @@ export class ProgressAggregator {
         this.onChange({
             state: 'error',
             overall: this.computeOverall(),
-            label: 'Ошибка',
+            label: 'admin.pz_map.phase.error',
             error: message,
         });
     }

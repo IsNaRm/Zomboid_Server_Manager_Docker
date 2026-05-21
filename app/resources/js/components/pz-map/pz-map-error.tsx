@@ -6,6 +6,8 @@
  *   - Network / parse failures (generic)
  */
 
+import { useTranslation } from '@/hooks/use-translation';
+
 interface Props {
     error: Error;
     onRetry?: () => void;
@@ -22,32 +24,11 @@ function classifyError(error: Error): ErrorKind {
     return 'generic';
 }
 
-const TITLES: Record<ErrorKind, string> = {
-    webgl: 'WebGL2 недоступен',
-    quota: 'Кончилось место в кэше браузера',
-    cancelled: 'Загрузка отменена',
-    network: 'Ошибка сети',
-    generic: 'Ошибка загрузки карты',
-};
-
-const HINTS: Record<ErrorKind, string> = {
-    webgl: 'Карта требует браузер с поддержкой WebGL 2.0. Минимальные '
-        + 'требования: Chrome 56+, Firefox 51+, Safari 15+, Edge 79+.',
-    quota: 'Браузеру не хватает места под IndexedDB кэш. Очисти кэш сайта '
-        + 'в настройках браузера ИЛИ разреши persistent storage. После — '
-        + 'обнови страницу.',
-    cancelled: 'Загрузка прервана пользователем. Нажми «Перезагрузить» чтобы '
-        + 'начать заново.',
-    network: 'Не удалось скачать данные карты с сервера. Проверь подключение '
-        + 'и перезагрузи страницу.',
-    generic: 'Что-то пошло не так. Попробуй обновить страницу. Если ошибка '
-        + 'повторяется — открой dev tools и посмотри console.',
-};
-
 export function PzMapError({ error, onRetry }: Props) {
+    const { t } = useTranslation();
     const kind = classifyError(error);
-    const title = TITLES[kind];
-    const hint = HINTS[kind];
+    const title = t(`admin.pz_map.error.${kind}_title`);
+    const hint = t(`admin.pz_map.error.${kind}_hint`);
     const isCancelled = kind === 'cancelled';
     return (
         <div className="absolute inset-0 z-[1000] flex items-center justify-center bg-zinc-950/95 text-zinc-100">
@@ -74,7 +55,7 @@ export function PzMapError({ error, onRetry }: Props) {
                             onClick={onRetry}
                             className="rounded-md bg-red-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-red-600"
                         >
-                            Попробовать снова
+                            {t('admin.pz_map.error.retry')}
                         </button>
                     )}
                     <button
@@ -82,7 +63,7 @@ export function PzMapError({ error, onRetry }: Props) {
                         onClick={() => window.location.reload()}
                         className="rounded-md border border-zinc-700 bg-zinc-800 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:bg-zinc-700"
                     >
-                        Перезагрузить страницу
+                        {t('admin.pz_map.error.reload')}
                     </button>
                 </div>
             </div>

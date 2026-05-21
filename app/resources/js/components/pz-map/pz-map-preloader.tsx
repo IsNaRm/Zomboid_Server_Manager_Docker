@@ -3,6 +3,7 @@
  * Активен пока renderer.state !== 'ready'.
  */
 
+import { useTranslation } from '@/hooks/use-translation';
 import type { ProgressSnapshot } from '@/lib/pz-renderer';
 
 interface Props {
@@ -11,8 +12,10 @@ interface Props {
 }
 
 export function PzMapPreloader({ progress, onCancel }: Props) {
+    const { t } = useTranslation();
     const pct = progress ? Math.round(progress.overall * 100) : 0;
-    const label = progress?.label ?? 'Подключение...';
+    const rawLabel = progress?.label ?? 'admin.pz_map.loading_label_connecting';
+    const label = rawLabel.startsWith('admin.pz_map.') ? t(rawLabel) : rawLabel;
     const eta = progress?.details?.etaSeconds;
 
     return (
@@ -30,12 +33,11 @@ export function PzMapPreloader({ progress, onCancel }: Props) {
                 </div>
                 {eta !== undefined && eta > 0 && (
                     <p className="text-center text-xs text-zinc-500">
-                        ~{Math.ceil(eta)} сек осталось
+                        {t('admin.pz_map.eta_seconds', { sec: String(Math.ceil(eta)) })}
                     </p>
                 )}
                 <p className="text-center text-xs text-zinc-500">
-                    Первая загрузка скачивает атлас и данные карты целиком.
-                    Следующие визиты будут мгновенными благодаря кэшу в браузере.
+                    {t('admin.pz_map.preloader_hint')}
                 </p>
                 {onCancel && (
                     <div className="flex justify-center pt-2">
@@ -44,7 +46,7 @@ export function PzMapPreloader({ progress, onCancel }: Props) {
                             onClick={onCancel}
                             className="rounded border border-zinc-700 bg-zinc-800 px-4 py-1.5 text-xs font-medium text-zinc-300 transition hover:border-red-500 hover:bg-red-900/30 hover:text-red-300"
                         >
-                            Отменить загрузку
+                            {t('admin.pz_map.cancel_load')}
                         </button>
                     </div>
                 )}
