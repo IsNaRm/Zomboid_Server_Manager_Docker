@@ -4,7 +4,7 @@ import { useMemo, useState } from 'react';
 import PlayerActionDialogs from '@/components/player-action-dialogs';
 import PzMap from '@/components/pz-map';
 import { useTranslation } from '@/hooks/use-translation';
-import type { ZoneOverlay } from '@/components/pz-map';
+import type { PzMapDisplayMode, ZoneOverlay } from '@/components/pz-map';
 import { Badge } from '@/components/ui/badge';
 import AppLayout from '@/layouts/app-layout';
 import type { BreadcrumbItem } from '@/types';
@@ -50,6 +50,17 @@ export default function PlayerMap({ markers, onlineCount, serverStatus, mapConfi
     const [kickTarget, setKickTarget] = useState<string | null>(null);
     const [banTarget, setBanTarget] = useState<string | null>(null);
     const [accessTarget, setAccessTarget] = useState<string | null>(null);
+    const [displayMode, setDisplayModeState] = useState<PzMapDisplayMode>(() => {
+        if (typeof window === 'undefined') return 'v41';
+        const stored = window.localStorage.getItem('pz-map-display-mode');
+        return stored === 'v41' || stored === 'v42' || stored === 'webgl' ? stored : 'v41';
+    });
+    const setDisplayMode = (m: PzMapDisplayMode) => {
+        setDisplayModeState(m);
+        if (typeof window !== 'undefined') {
+            window.localStorage.setItem('pz-map-display-mode', m);
+        }
+    };
 
     const counts = useMemo(() => {
         const online = Math.max(onlineCount, markers.filter((m) => m.status === 'online').length);
@@ -84,9 +95,25 @@ export default function PlayerMap({ markers, onlineCount, serverStatus, mapConfi
     return (
         <AppLayout breadcrumbs={breadcrumbs}>
             <Head title={t('admin.player_map.title')} />
-            <div className="relative flex flex-1 flex-col">
-                <div className="pointer-events-none absolute top-3 right-3 z-[1000] flex flex-wrap items-start justify-end gap-3">
-                    <div className="pointer-events-auto flex flex-wrap items-center gap-2 rounded-lg bg-background/85 px-2 py-1.5 shadow-sm backdrop-blur-sm">
+            <div className="flex flex-1 flex-col">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-background px-4 py-2">
+                    <div className="flex items-center gap-1 rounded-md border bg-muted/30 p-0.5">
+                        {(['v41', 'v42', 'webgl'] as const).map((m) => (
+                            <button
+                                key={m}
+                                type="button"
+                                onClick={() => setDisplayMode(m)}
+                                className={`rounded px-3 py-1 text-xs font-medium transition ${
+                                    displayMode === m
+                                        ? 'bg-primary text-primary-foreground shadow-sm'
+                                        : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                                }`}
+                            >
+                                {t(`admin.pz_map.display_mode.${m}`)}
+                            </button>
+                        ))}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
                         <Badge variant="outline" className="text-xs">
                             <Circle className="mr-1.5 size-2 fill-green-500 text-green-500" />
                             {t('admin.player_map.online_count', { count: String(counts.online) })}
@@ -103,6 +130,7 @@ export default function PlayerMap({ markers, onlineCount, serverStatus, mapConfi
                         )}
                     </div>
                 </div>
+                <div className="relative flex flex-1 flex-col">
 
                 {(serverStatus === 'offline' || serverStatus === 'starting') && (
                     <div className="pointer-events-auto absolute top-20 left-1/2 z-[1000] -translate-x-1/2 max-w-md">
@@ -151,8 +179,10 @@ export default function PlayerMap({ markers, onlineCount, serverStatus, mapConfi
                     hasTiles={hasTiles}
                     onMarkerAction={handleMarkerAction}
                     zones={zoneOverlays}
+                    displayMode={displayMode}
                     className=""
                 />
+                </div>
             </div>
 
             <PlayerActionDialogs

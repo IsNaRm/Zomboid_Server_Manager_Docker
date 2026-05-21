@@ -15,14 +15,51 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { PzMapError } from './pz-map-error';
 import { PzMapPreloader } from './pz-map-preloader';
+import { PzTileMap, type DziSource } from './pz-tile-map';
 import { useMapRenderer } from '@/hooks/use-map-renderer';
 import { useTranslation } from '@/hooks/use-translation';
 import type { PzMapRenderer } from '@/lib/pz-renderer';
+
+/** Источники карты на выбор пользователя. */
+export type PzMapDisplayMode = 'v41' | 'v42' | 'webgl';
+
+export const PZ_MAP_DISPLAY_MODES: ReadonlyArray<PzMapDisplayMode> = ['v41', 'v42', 'webgl'];
+
+/**
+ * Configurations DZI пирамид. Параметры взяты прямо с серверов:
+ *  - v41: legacy proxy_dzi из app/config/zomboid.php
+ *    (https://map.projectzomboid.com/maps/SurvivalB417812L0).
+ *  - v42: b42map.com/map_data/base/map_info.json.
+ */
+const TILE_SOURCES: Record<Exclude<PzMapDisplayMode, 'webgl'>, DziSource> = {
+    v41: {
+        tileUrl: 'https://map.projectzomboid.com/maps/SurvivalB417812L0/map_files/{z}/{x}_{y}.jpg',
+        tileSize: 1024,
+        width: 2285184,
+        height: 990400,
+        x0: 1017856,
+        y0: -152032,
+        sqr: 128,
+        maxNativeZoom: 22,
+    },
+    v42: {
+        tileUrl: 'https://b42map.com/map_data/base/layer0_files/{z}/{x}_{y}.jpg',
+        tileSize: 1024,
+        width: 2314432,
+        height: 1019072,
+        x0: 1036288,
+        y0: -139296,
+        sqr: 128,
+        maxNativeZoom: 22,
+    },
+};
 
 export interface PzMapViewProps {
     className?: string;
     atlasBaseUrl?: string;
     cellsBaseUrl?: string;
+    /** Управляемый извне режим отображения (v41 / v42 / WebGL). */
+    displayMode?: PzMapDisplayMode;
 }
 
 type DebugMode = 'atlas' | 'cell';
@@ -31,6 +68,7 @@ export function PzMapView({
     className = '',
     atlasBaseUrl,
     cellsBaseUrl,
+    displayMode = 'webgl',
 }: PzMapViewProps) {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const { t } = useTranslation();
@@ -40,6 +78,7 @@ export function PzMapView({
         canvasRef,
         atlasBaseUrl,
         cellsBaseUrl,
+        enabled: displayMode === 'webgl',
     });
 
     const [mode, setMode] = useState<DebugMode>('cell');
@@ -166,12 +205,13 @@ export function PzMapView({
         setPps(newPps);
     };
     useEffect(() => {
+        if (displayMode !== 'webgl') return;
         const canvas = canvasRef.current;
         if (!canvas) return;
         const handler = (e: WheelEvent): void => wheelHandlerRef.current?.(e);
         canvas.addEventListener('wheel', handler, { passive: false });
         return () => canvas.removeEventListener('wheel', handler);
-    }, []);
+    }, [displayMode]);
 
     // При смене mode/values — push в renderer.
     useEffect(() => {
@@ -266,21 +306,34 @@ export function PzMapView({
         renderer.setDebugView({ fragDebug });
     }, [renderer, isReady, fragDebug]);
 
+    const isWebgl = displayMode === 'webgl';
+    const tileSrc = isWebgl ? null : TILE_SOURCES[displayMode];
+    const showWebglUi = isWebgl && isReady;
+
     return (
         <div className={`relative isolate h-full w-full ${className}`}>
-            <canvas
-                ref={canvasRef}
-                className="absolute inset-0 h-full w-full"
-                style={{ cursor: mode === 'cell' ? 'grab' : 'default' }}
-                onMouseDown={mode === 'cell' ? handleMouseDown : undefined}
-                onMouseMove={mode === 'cell' ? handleMouseMove : undefined}
-                onMouseUp={mode === 'cell' ? handleMouseUp : undefined}
-                onMouseLeave={mode === 'cell' ? handleMouseUp : undefined}
-            />
-            {showPreloader && <PzMapPreloader progress={progress} onCancel={cancel} />}
-            {error && <PzMapError error={error} />}
-            {isReady && (
-                <div className="absolute left-3 top-3 z-[900] flex max-h-[calc(100vh-1.5rem)] flex-col gap-2">
+            {isWebgl ? (
+                <canvas
+                    ref={canvasRef}
+                    className="absolute inset-0 h-full w-full"
+                    style={{ cursor: mode === 'cell' ? 'grab' : 'default' }}
+                    onMouseDown={mode === 'cell' ? handleMouseDown : undefined}
+                    onMouseMove={mode === 'cell' ? handleMouseMove : undefined}
+                    onMouseUp={mode === 'cell' ? handleMouseUp : undefined}
+                    onMouseLeave={mode === 'cell' ? handleMouseUp : undefined}
+                />
+            ) : tileSrc ? (
+                <PzTileMap
+                    key={displayMode}
+                    dzi={tileSrc}
+                    className="absolute inset-0"
+                />
+            ) : null}
+            {isWebgl && showPreloader && <PzMapPreloader progress={progress} onCancel={cancel} />}
+            {isWebgl && error && <PzMapError error={error} />}
+            <div className="absolute left-3 top-3 z-[900] flex max-h-[calc(100vh-1.5rem)] flex-col gap-2">
+                {showWebglUi && (
+                    <>
                     {/* Toggle bar */}
                     <div className="flex gap-1">
                         <button
@@ -359,8 +412,9 @@ export function PzMapView({
                         </div>
                     )}
                     {showStats && <CellStatsHud renderer={renderer} />}
-                </div>
-            )}
+                    </>
+                )}
+            </div>
         </div>
     );
 }

@@ -15,8 +15,10 @@
 
 import L from 'leaflet';
 
-import { PzMapView } from './pz-map/pz-map-view';
+import { PzMapView, type PzMapDisplayMode } from './pz-map/pz-map-view';
 import type { MapConfig, PlayerMarker } from '@/types/server';
+
+export type { PzMapDisplayMode };
 
 type MarkerAction = 'kick' | 'ban' | 'access' | 'inventory';
 
@@ -63,10 +65,11 @@ interface PzMapProps {
     eventMarkers?: EventMarker[];
     onEventMarkerClick?: (marker: EventMarker) => void;
     onMapReady?: (map: L.Map) => void;
+    displayMode?: PzMapDisplayMode;
 }
 
-export default function PzMap({ className }: PzMapProps) {
+export default function PzMap({ className, displayMode }: PzMapProps) {
     // Phase 1: рендерим базовую WebGL карту с debug viewer.
     // Markers, zones, drawing — вернутся в Phase 4 (Leaflet интеграция).
-    return <PzMapView className={className} />;
+    return <PzMapView className={className} displayMode={displayMode} />;
 }

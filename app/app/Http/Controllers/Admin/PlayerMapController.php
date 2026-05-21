@@ -192,4 +192,5 @@ class PlayerMapController extends Controller
             'Content-Type' => $contentType,
         ]);
     }
+
 }
