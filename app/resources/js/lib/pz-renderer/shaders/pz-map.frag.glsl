@@ -26,12 +26,9 @@ void main() {
     }
 
     vec4 c = texture(uAtlasArray, vec3(vUv, float(vAtlasPage)));
-    if (c.a < 0.01) discard;
-    // Чёрная обводка fix: LINEAR фильтр смешивает edge sprite pixel с
-    // соседним transparent pixel (RGB=0). Sampled.rgb получается затемнённым
-    // относительно sampled.alpha → halo при straight-alpha blend.
-    // Recovery: rgb / alpha восстанавливает "исходный" цвет — работает и
-    // для premultiplied и для straight-alpha atlas storage.
-    vec3 unbleed = clamp(c.rgb / c.a, 0.0, 1.0);
-    fragColor = vec4(unbleed, c.a * vAlpha);
+    // Hard alpha cutoff: atlas filter теперь NEAREST (pixel-perfect),
+    // partial alpha бывает только если у самого sprite content soft edges.
+    // 0.5 threshold убирает оставшиеся artifacts на границах.
+    if (c.a < 0.5) discard;
+    fragColor = vec4(c.rgb, c.a * vAlpha);
 }

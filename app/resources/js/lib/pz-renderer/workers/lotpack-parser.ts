@@ -282,12 +282,13 @@ export function packLotpackEntries(
         }
     }
 
-    const tmpE0 = new Uint32Array(entriesCount);
-    const tmpE1 = new Uint32Array(entriesCount);
+    // Compact 1-texel encoding (ground-only mode): один u32 per entry.
+    // Layout: sprite_id (16 bits) | sx (8) | sy (8). Drop layer/zStack/flags
+    // (всегда 0 в ground-only режиме).
+    const tmpE = new Uint32Array(entriesCount);
     const tmpK = new Uint8Array(entriesCount);
     let i = 0;
 
-    // Второй проход — заполняем temp arrays.
     for (let bx = 0; bx < cellSizeInBlocks; bx++) {
         for (let by = 0; by < cellSizeInBlocks; by++) {
             const block = blocks[bx * cellSizeInBlocks + by];
@@ -297,7 +298,6 @@ export function packLotpackEntries(
                 if (worldLayer < keepMin || worldLayer >= keepMax) continue;
                 const layerData = block[z];
                 if (!layerData) continue;
-                const layerEncoded = (worldLayer + 32) & 0xff;
                 for (let x = 0; x < blockSize; x++) {
                     const rowData = layerData[x];
                     if (!rowData) continue;
@@ -306,18 +306,13 @@ export function packLotpackEntries(
                         const tiles = rowData[y];
                         if (!tiles) continue;
                         const syWorld = (by * blockSize + y) & 0xff;
-                        let stackIdx = 0;
                         for (const localId of tiles) {
                             if (localId < 0 || localId >= localToGlobal.length) continue;
                             const globalId = localToGlobal[localId]!;
                             if (globalId < 0) continue;
-                            const zStack = stackIdx & 0xff;
-                            const flags = 0;
-                            tmpE0[i] = (globalId & 0x00ffffff) | (layerEncoded << 24);
-                            tmpE1[i] = sxWorld | (syWorld << 8) | (zStack << 16) | (flags << 24);
+                            tmpE[i] = ((globalId & 0xffff) | (sxWorld << 16) | (syWorld << 24)) >>> 0;
                             tmpK[i] = strideLevel(sxWorld, syWorld);
                             i++;
-                            stackIdx++;
                         }
                     }
                 }
@@ -358,15 +353,14 @@ export function packLotpackEntries(
         strideOffsets[K] = cum;
     }
 
-    // Scatter в packed.
-    const packed = new Uint32Array(entriesCount * 2);
+    // Scatter в packed (1 u32 per entry — compact ground-only format).
+    const packed = new Uint32Array(entriesCount);
     const writeIdx = bucketWritePos.slice();
     for (let j = 0; j < entriesCount; j++) {
         const K = tmpK[j]!;
         const out = writeIdx[K]!;
         writeIdx[K]++;
-        packed[out * 2] = tmpE0[j]!;
-        packed[out * 2 + 1] = tmpE1[j]!;
+        packed[out] = tmpE[j]!;
     }
 
     return { packed, entriesCount, strideOffsets };

@@ -39,7 +39,8 @@ const PARALLEL_BULK_REQUESTS = 6;
 
 export interface CellLoaderOptions {
     pool: WorkerPool;
-    textureMgr: CellTextureManager;
+    /** Phase 5.9: textureMgr опционален. Если undefined, packs буферизируются. */
+    textureMgr: CellTextureManager | null;
     cellsManifest: CellsManifest;
     cellsBaseUrl: string;
     /** Версия atlas (для IDB cache keying). */
@@ -55,6 +56,13 @@ export interface CellLoaderOptions {
     progressiveReadyThreshold?: number;
     onProgressiveReady?: () => void;
     signal?: AbortSignal;
+    /**
+     * Phase 5.9: при true workers parsing, но packs не uploaded в atlas
+     * (textureMgr игнорируется). Packs хранятся в `deferredPacks` map.
+     * После завершения preflight, renderer compute exact atlas sizes
+     * и invokes `flushDeferred(textureMgr)`.
+     */
+    deferAppend?: boolean;
 }
 
 export interface CellLoaderStats {
@@ -75,6 +83,8 @@ export class CellLoader {
     private bytesFromNetwork = 0;
     private packedCacheHits = 0;
     private progressiveReadyFired = false;
+    /** Phase 5.9: deferred packs (when deferAppend=true). */
+    readonly deferredPacks: Map<string, { cellX: number; cellY: number; packed: Uint32Array; strideOffsets: Uint32Array }> = new Map();
 
     private maybeFireProgressiveReady(): void {
         if (this.progressiveReadyFired) return;
@@ -86,6 +96,202 @@ export class CellLoader {
     }
 
     constructor(private readonly opts: CellLoaderOptions) {}
+
+    /**
+     * Phase 4.4: load specific subset of cells (streaming mode). Don't
+     * dispose workers — могут понадобиться для следующего batch.
+     * `cellsToLoad` — массив [cellX, cellY] для загрузки.
+     */
+    async loadCells(cellsToLoad: Array<[number, number]>): Promise<CellLoaderStats> {
+        const total = cellsToLoad.length;
+
+        const batches: Array<Array<[number, number]>> = [];
+        for (let i = 0; i < cellsToLoad.length; i += BULK_REQUEST_LIMIT) {
+            batches.push(cellsToLoad.slice(i, i + BULK_REQUEST_LIMIT));
+        }
+
+        await mapLimit(batches, PARALLEL_BULK_REQUESTS, async (batch) => {
+            await this.processBatch(batch, total);
+        });
+
+        this.opts.textureMgr?.flush();
+
+        return {
+            totalCells: total,
+            parsedCells: this.parsedCells,
+            skippedCells: this.skippedCells,
+            totalEntries: this.opts.textureMgr?.getInfo().totalEntries ?? 0,
+            bytesFromCache: this.bytesFromCache,
+            bytesFromNetwork: this.bytesFromNetwork,
+            packedCacheHits: this.packedCacheHits,
+        };
+    }
+
+    /**
+     * Phase 5.5: super-cell load. К>0 → cells grouped into supers
+     * (anchor + N²-1 sub-cells). Один merged super-pack appendится at
+     * anchor coords, draw call один на N² cells.
+     *
+     * Entries из каждого sub-cell фильтруются strideOffsets[K] (только
+     * stride-N-aligned tiles) и re-encoded:
+     *   storedSx = subX * (256/N) + origSx / N
+     * Worth N×N base cells данных сжимается до примерно одного
+     * cell-worth (= same as К=0 single cell).
+     */
+    async loadSuperCells(
+        anchors: Array<[number, number]>,
+        K: number,
+    ): Promise<CellLoaderStats> {
+        const N = 1 << K;
+        const total = anchors.length;
+
+        await mapLimit(anchors, PARALLEL_BULK_REQUESTS, async ([anchorCx, anchorCy]) => {
+            await this.processSuper(anchorCx, anchorCy, N, K, total);
+        });
+
+        this.opts.textureMgr?.flush();
+
+        return {
+            totalCells: total,
+            parsedCells: this.parsedCells,
+            skippedCells: this.skippedCells,
+            totalEntries: this.opts.textureMgr?.getInfo().totalEntries ?? 0,
+            bytesFromCache: this.bytesFromCache,
+            bytesFromNetwork: this.bytesFromNetwork,
+            packedCacheHits: this.packedCacheHits,
+        };
+    }
+
+    private async processSuper(
+        anchorCx: number,
+        anchorCy: number,
+        N: number,
+        K: number,
+        total: number,
+    ): Promise<void> {
+        const subPacks: Array<{
+            subX: number;
+            subY: number;
+            packed: Uint32Array;
+            strideOffsets: Uint32Array;
+        } | null> = new Array(N * N).fill(null);
+
+        const subTasks: Array<Promise<void>> = [];
+        for (let subY = 0; subY < N; subY++) {
+            for (let subX = 0; subX < N; subX++) {
+                const cellX = anchorCx + subX;
+                const cellY = anchorCy + subY;
+                const slot = subY * N + subX;
+                subTasks.push(
+                    this.getCellPacked(cellX, cellY).then((p) => {
+                        if (p) {
+                            subPacks[slot] = { subX, subY, packed: p.packed, strideOffsets: p.strideOffsets };
+                        }
+                    }).catch((err) => {
+                        console.warn(`[cell-loader] super-sub (${cellX},${cellY}) failed:`, err);
+                    }),
+                );
+            }
+        }
+        await Promise.all(subTasks);
+
+        const out = this.mergeSuperPack(subPacks, N, K);
+        if (out.length === 0) {
+            this.skippedCells++;
+            this.opts.onCellProgress?.(this.parsedCells + this.skippedCells, total);
+            return;
+        }
+
+        // Super-pack уже pre-filtered to stride-N. Render uses ВСЕ entries
+        // в super-pack — strideOffsets[K] = total для любого K (forced
+        // render K == loadK в renderer, Phase 5 bump disabled in super-mode).
+        const superStrideOffsets = new Uint32Array(7).fill(out.length / 2);
+        this.appendOrDefer(anchorCx, anchorCy, out, superStrideOffsets);
+        this.parsedCells++;
+        this.maybeFireProgressiveReady();
+        this.opts.onCellProgress?.(this.parsedCells + this.skippedCells, total);
+    }
+
+    private async getCellPacked(
+        cellX: number,
+        cellY: number,
+    ): Promise<{ packed: Uint32Array; strideOffsets: Uint32Array } | null> {
+        const cached = await getCachedPackedCell(
+            this.opts.atlasVersion,
+            cellX,
+            cellY,
+        );
+        if (cached) {
+            this.packedCacheHits++;
+            this.bytesFromCache
+                += cached.packed.byteLength + cached.strideOffsets.byteLength;
+            return {
+                packed: new Uint32Array(cached.packed),
+                strideOffsets: new Uint32Array(cached.strideOffsets),
+            };
+        }
+        // Fetch raw binaries (через bulk endpoint, 1 cell в batch).
+        const binsMap = await this.bulkFetch([[cellX, cellY]]);
+        const bins = binsMap.get(`${cellX}_${cellY}`);
+        if (!bins) return null;
+        this.bytesFromNetwork += bins.header.byteLength + bins.lotpack.byteLength;
+        void putCachedCellBinary(this.opts.atlasVersion, cellX, cellY, 'header', bins.header).catch(() => {});
+        void putCachedCellBinary(this.opts.atlasVersion, cellX, cellY, 'lotpack', bins.lotpack).catch(() => {});
+        const result = await this.opts.pool.parseCell(
+            cellX,
+            cellY,
+            bins.header.slice(0),
+            bins.lotpack.slice(0),
+        );
+        const packed = new Uint32Array(result.packed);
+        const strideOffsets = new Uint32Array(result.strideOffsets);
+        void putCachedPackedCell(this.opts.atlasVersion, cellX, cellY, {
+            packed: packed.buffer as ArrayBuffer,
+            strideOffsets: strideOffsets.buffer as ArrayBuffer,
+            entriesCount: result.entriesCount,
+        }).catch(() => {});
+        return { packed, strideOffsets };
+    }
+
+    private mergeSuperPack(
+        subs: Array<{
+            subX: number;
+            subY: number;
+            packed: Uint32Array;
+            strideOffsets: Uint32Array;
+        } | null>,
+        N: number,
+        K: number,
+    ): Uint32Array {
+        let total = 0;
+        for (const sub of subs) {
+            if (sub) total += sub.strideOffsets[K] ?? 0;
+        }
+        if (total === 0) return new Uint32Array(0);
+
+        const out = new Uint32Array(total * 2);
+        let outIdx = 0;
+        const division = (256 / N) | 0;
+
+        for (const sub of subs) {
+            if (!sub) continue;
+            const keepCount = sub.strideOffsets[K] ?? 0;
+            for (let i = 0; i < keepCount; i++) {
+                const e0 = sub.packed[i * 2]!;
+                const e1 = sub.packed[i * 2 + 1]!;
+                const origSx = e1 & 0xff;
+                const origSy = (e1 >> 8) & 0xff;
+                // (subX*256 + origSx) / N = subX*(256/N) + origSx/N
+                const newSx = (sub.subX * division + ((origSx / N) | 0)) & 0xff;
+                const newSy = (sub.subY * division + ((origSy / N) | 0)) & 0xff;
+                const newE1 = ((e1 & 0xffff0000) | newSx | (newSy << 8)) >>> 0;
+                out[outIdx * 2] = e0;
+                out[outIdx * 2 + 1] = newE1;
+                outIdx++;
+            }
+        }
+        return out;
+    }
 
     async loadAll(): Promise<CellLoaderStats> {
         const cells = this.opts.cellsManifest.cells;
@@ -103,13 +309,13 @@ export class CellLoader {
         });
 
         // Финальный flush GPU buffers.
-        this.opts.textureMgr.flush();
+        this.opts.textureMgr?.flush();
 
         return {
             totalCells: total,
             parsedCells: this.parsedCells,
             skippedCells: this.skippedCells,
-            totalEntries: this.opts.textureMgr.getInfo().totalEntries,
+            totalEntries: this.opts.textureMgr?.getInfo().totalEntries ?? 0,
             bytesFromCache: this.bytesFromCache,
             bytesFromNetwork: this.bytesFromNetwork,
             packedCacheHits: this.packedCacheHits,
@@ -136,7 +342,7 @@ export class CellLoader {
             if (cached) {
                 const packed = new Uint32Array(cached.packed);
                 const strideOffsets = new Uint32Array(cached.strideOffsets);
-                this.opts.textureMgr.append(cx, cy, packed, strideOffsets);
+                this.appendOrDefer(cx, cy, packed, strideOffsets);
                 this.parsedCells++;
                 this.packedCacheHits++;
                 this.bytesFromCache
@@ -152,8 +358,7 @@ export class CellLoader {
         }
 
         if (stillNeedingParse.length === 0) {
-            // Весь batch from packed cache — skip остальные шаги.
-            this.opts.textureMgr.flush();
+            this.opts.textureMgr?.flush();
             return;
         }
 
@@ -228,7 +433,7 @@ export class CellLoader {
                         strideOffsets: strideOffsets.buffer as ArrayBuffer,
                         entriesCount: result.entriesCount,
                     }).catch(() => {/* IDB quota — non-fatal */});
-                    this.opts.textureMgr.append(cx, cy, packed, strideOffsets);
+                    this.appendOrDefer(cx, cy, packed, strideOffsets);
                     this.parsedCells++;
                     this.maybeFireProgressiveReady();
                 } catch (err) {
@@ -247,7 +452,34 @@ export class CellLoader {
         await Promise.all(parseTasks);
 
         // Flush GPU buffers пакетно (каждый batch).
-        this.opts.textureMgr.flush();
+        this.opts.textureMgr?.flush();
+    }
+
+    /** Phase 5.9: append или defer в зависимости от opts.deferAppend. */
+    private appendOrDefer(
+        cx: number,
+        cy: number,
+        packed: Uint32Array,
+        strideOffsets: Uint32Array,
+    ): void {
+        if (this.opts.deferAppend) {
+            this.deferredPacks.set(`${cx}_${cy}`, { cellX: cx, cellY: cy, packed, strideOffsets });
+        } else if (this.opts.textureMgr) {
+            this.opts.textureMgr.append(cx, cy, packed, strideOffsets);
+        }
+    }
+
+    /**
+     * Phase 5.9: flush all deferred packs к provided textureMgr.
+     * Используется after preflight phase когда atlas сoздаётся с точными
+     * размерами на основе know-ledge о реальных entry counts.
+     */
+    flushDeferred(textureMgr: CellTextureManager): void {
+        for (const { cellX, cellY, packed, strideOffsets } of this.deferredPacks.values()) {
+            textureMgr.append(cellX, cellY, packed, strideOffsets);
+        }
+        textureMgr.flush();
+        this.deferredPacks.clear();
     }
 
     /**

@@ -46,17 +46,15 @@ self.onmessage = (ev: MessageEvent<WorkerMessageIn>) => {
             blockSize: header.blockSize,
             cellSizeInBlocks: header.cellSizeInBlocks,
         });
-        // Keep этажи 0..3 (ground + 3 верхних). PZ buildings типично
-        // 1-3 этажа, basement (layer -1) редок и пока не поддерживаем.
-        // Vertex shader фильтрует через uMaxFloor uniform — пользователь
-        // через UI slider может прятать верхние этажи (например показать
-        // только ground для аэровью).
+        // Keep ТОЛЬКО ground layer (layer=0). VRAM economy 4×: atlas 8192h
+        // вместо 16384h = 512MB вместо 1GB. Upper floors можно включить
+        // через UI toggle (отдельная подгрузка из IDB cache).
         const { packed, entriesCount, strideOffsets } = packLotpackEntries(
             lotpack,
             header.cellSizeInBlocks,
             header.spriteNames,
             spriteNameToId,
-            { keepMinLayer: 0, keepMaxLayer: 4 },
+            { keepMinLayer: 0, keepMaxLayer: 1 },
         );
         const parseTimeMs = performance.now() - t0;
 

@@ -28,6 +28,8 @@ import {
 } from './gpu/sprite-info-texture';
 import { AtlasLoader, type LodTexture } from './loaders/atlas-loader';
 import { CellLoader, buildSpriteNameToId, type CellLoaderStats } from './loaders/cell-loader';
+import { StreamingManager } from './loaders/streaming-manager';
+import { computeRectCover } from './utils/rect-cover';
 import { loadAllManifests, type AllManifests } from './loaders/manifest-loader';
 import { cellBoundsInPixels, makeOrthoMatrix } from './utils/coords';
 import { ProgressAggregator } from './utils/progress';
@@ -90,6 +92,14 @@ export class PzMapRenderer {
     private cellTextureMgr: CellTextureManager | null = null;
     private spriteInfoTex: SpriteInfoTexture | null = null;
     private workerPool: WorkerPool | null = null;
+    /** Phase 4.4: streaming manager — alive throughout session, не
+     *  disposed после init (workers нужны for on-demand parse). */
+    private streamingMgr: StreamingManager | null = null;
+    /** Last view signature чтобы триггерить streaming.update только при
+     *  значимом view change (а не каждый frame). */
+    private lastStreamingViewSig = '';
+    /** Manifest existing cells set — reused в визибилити вычислениях. */
+    private existingCellsSet: Set<string> | null = null;
     private cellStats: CellLoaderStats | null = null;
 
     private state: RendererState = 'idle';
@@ -103,7 +113,7 @@ export class PzMapRenderer {
         cellX: 0,
         cellY: 0,
         isometric: true,
-        sqr: 64,
+        sqr: 16,
         pps: 1.0,
         maxFloor: 3,
         floorHeightPx: 192,
@@ -260,14 +270,77 @@ export class PzMapRenderer {
 
             const indexGridWidth = Math.max(1, maxCx - minCx + 1);
             const indexGridHeight = Math.max(1, maxCy - minCy + 1);
-            // cellAtlas size: до 16384×16384 R32UI (= 268M texels = 1 GB).
-            // При keepMaxLayer=4 (4 этажа) ожидаемый объём entries ≈
-            // 100-130M (ground 67M + sparse upper floors). 268M = двойной
-            // запас. Phase 4 (streaming) уберёт необходимость хранить
-            // всё одновременно.
+            // cellAtlas size: 16384×16384 R32UI (= 268M texels = 1 GB VRAM).
+            // Ground-only mode не помещается в 8192h (cell (1,58) одна =
+            // 167k texels, total ~150-240M). Возвращаем 16384h для запаса.
+            // VRAM экономится через keepMaxLayer=1 в parse time (меньше
+            // entries) но atlas storage same.
             const maxTex = this.capabilities.maxTextureSize;
             const ATLAS_WIDTH = Math.min(16384, maxTex);
             const ATLAS_HEIGHT = Math.min(16384, maxTex);
+
+            // Phase 5.9: rect_cover + preflight parse. Сначала parsim все
+            // cells через workers с deferAppend=true, packed buffers
+            // буферизируются в JS. Затем считаем точные размеры per region
+            // (через packed.length sum) и создаём atlases. Финально
+            // appendим buffered packs.
+            const regionRects = computeRectCover(this.manifests.cells.cells);
+            console.info(
+                `[renderer] computed ${regionRects.length} region rects:`,
+                regionRects,
+            );
+
+            // Worker pool + sprite name → id mapping (нужны ДО preflight).
+            this.workerPool = new WorkerPool();
+            const spriteNameToId = buildSpriteNameToId(this.manifests.sprites);
+            this.workerPool.initSpriteIndex(spriteNameToId);
+
+            // Preflight loader: parse all cells, buffer packs (no atlas yet).
+            const preflightLoader = new CellLoader({
+                pool: this.workerPool,
+                textureMgr: null,
+                cellsManifest: this.manifests.cells,
+                cellsBaseUrl: this.opts.cellsBaseUrl,
+                atlasVersion: this.manifests.atlas.version,
+                signal,
+                deferAppend: true,
+                onCellProgress: (loaded, total) => {
+                    this.progress.setPhaseProgress('cells', loaded / total);
+                },
+            });
+
+            const preflightStats = await preflightLoader.loadAll();
+            console.info(
+                `[renderer] preflight done: ${preflightStats.parsedCells} cells, ${preflightLoader.deferredPacks.size} packs`,
+            );
+
+            // Compute exact texels per region (sum of packed.length).
+            const regionTexels = new Array(regionRects.length).fill(0);
+            const inRect = (rx: number, ry: number, rw: number, rh: number, cx: number, cy: number): boolean =>
+                cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh;
+            for (const pack of preflightLoader.deferredPacks.values()) {
+                for (let i = 0; i < regionRects.length; i++) {
+                    const [rx, ry, rw, rh] = regionRects[i]!;
+                    if (inRect(rx, ry, rw, rh, pack.cellX, pack.cellY)) {
+                        regionTexels[i] += pack.packed.length;
+                        break;
+                    }
+                }
+            }
+
+            // Atlas heights точные + 5% safety + alignment 64.
+            const SAFETY = 1.05;
+            const ALIGN = 64;
+            const atlasHeights = regionTexels.map((texels, i) => {
+                const required = Math.ceil(texels * SAFETY);
+                const minH = Math.max(64, Math.ceil(required / ATLAS_WIDTH));
+                const aligned = Math.ceil(minH / ALIGN) * ALIGN;
+                console.info(
+                    `[renderer] region ${i}: ${texels} actual texels → atlas ${ATLAS_WIDTH}×${aligned} `
+                    + `(${((ATLAS_WIDTH * aligned * 4) / 1024 / 1024).toFixed(0)} MB)`,
+                );
+                return Math.min(aligned, ATLAS_HEIGHT);
+            });
 
             this.cellTextureMgr = new CellTextureManager({
                 gl: this.gl,
@@ -277,37 +350,26 @@ export class PzMapRenderer {
                 indexGridHeight,
                 originCellX: minCx,
                 originCellY: minCy,
+                atlasHeights,
+                regionRects,
             });
 
-            // Worker pool + sprite name → id mapping.
-            this.workerPool = new WorkerPool();
-            const spriteNameToId = buildSpriteNameToId(this.manifests.sprites);
-            this.workerPool.initSpriteIndex(spriteNameToId);
+            // Flush deferred packs → atlas (synchronous, fast — packs в RAM).
+            preflightLoader.flushDeferred(this.cellTextureMgr);
 
-            // Phase 4.3b.3: progressive ready. Cell loading в background;
-            // ready после первых N cells. Сначала промис на этот сигнал.
+            // Reuse stats (preflight уже parsed everything).
+            const cellLoader = preflightLoader;
+
+            // firstReadyPromise resolves сразу — atlas заполнен.
             let firstReadyResolve!: () => void;
             const firstReadyPromise = new Promise<void>((r) => {
                 firstReadyResolve = r;
             });
 
-            const cellLoader = new CellLoader({
-                pool: this.workerPool,
-                textureMgr: this.cellTextureMgr,
-                cellsManifest: this.manifests.cells,
-                cellsBaseUrl: this.opts.cellsBaseUrl,
-                atlasVersion: this.manifests.atlas.version,
-                signal,
-                onCellProgress: (loaded, total) => {
-                    this.progress.setPhaseProgress('cells', loaded / total);
-                },
-                progressiveReadyThreshold: 100,
-                onProgressiveReady: () => firstReadyResolve(),
-            });
-
-            // Запускаем cell loading в фоне.
+            // Bulk loadAll completed via preflight. workerPool dispose
+            // immediately.
             const workerPoolRef = this.workerPool;
-            const cellLoadPromise = cellLoader.loadAll()
+            const cellLoadPromise = Promise.resolve(preflightStats)
                 .then((stats) => {
                     this.cellStats = stats;
                     this.progress.setPhaseProgress('cells', 1);
@@ -321,9 +383,6 @@ export class PzMapRenderer {
                     console.error('[renderer] cell loader failed:', err);
                 });
             void cellLoadPromise;
-
-            // Если cells меньше threshold или быстро прогрузились — resolve
-            // на complete, не дожидаемся ровно 100.
             void cellLoadPromise.then(() => firstReadyResolve());
 
             this.setState('finalizing');
@@ -367,6 +426,7 @@ export class PzMapRenderer {
                     'uDebugMode',
                     'uNativeSqr',
                     'uAtlasNativeSize',
+                    'uLodAtlasSize',
                     'uMaxFloor',
                     'uFloorHeightPx',
                     'uMaxWorldDepth',
@@ -555,6 +615,10 @@ export class PzMapRenderer {
         gl.uniform1i(u.uNLods!, this.manifests.atlas.lods.length);
         gl.uniform1i(u.uDebugMode!, this.debugView.fragDebug);
         gl.uniform1f(u.uAtlasNativeSize!, this.manifests.sprites.atlas_size);
+        // Phase 6.1: current LOD atlas page size для UV inset.
+        const lodInfo = this.manifests.atlas.lods.find((l) => l.id === effectiveLod)
+            ?? this.manifests.atlas.lods[0]!;
+        gl.uniform1f(u.uLodAtlasSize!, lodInfo.size);
         gl.uniform1i(u.uMaxFloor!, maxFloor);
         gl.uniform1f(u.uFloorHeightPx!, floorHeightPx);
         // effectiveStride = sprite scale + stride-bucket selector.
@@ -569,6 +633,12 @@ export class PzMapRenderer {
             Math.min(6, Math.round(Math.log2(effectiveStride))),
         );
 
+        // Phase 4.5: atlas slot size держится по ЗАПРОШЕННОМУ К (из tuning,
+        // не bumped). Это стабильное, меняется только при реальном zoom-change.
+        // Phase 5 bump только режет render subset (instance count) — не trogem
+        // atlas. Hysteresis применяется в setCurrentK.
+        // Streaming disabled — bulk loadAll режим.
+
         // Global depth normalizer: max world sx+sy across весь loaded map.
         // Buffer +cellSize×2 чтобы layer/stack punches не вылезли за [-1..1].
         const range = this.getCellRange();
@@ -580,7 +650,8 @@ export class PzMapRenderer {
         // ---------- Bind textures (once per frame) ----------
         const cellInfo = this.cellTextureMgr.getInfo();
         gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, cellInfo.cellAtlas);
+        // Binding делается per cell в Phase 3 loop (с группировкой
+        // по atlasLayer). Здесь только uniform0 unit + width.
         gl.uniform1i(u.uCellAtlas!, 0);
         gl.uniform1i(u.uCellAtlasWidth!, cellInfo.atlasWidth);
 
@@ -613,22 +684,33 @@ export class PzMapRenderer {
             return;
         }
 
-        let drawn = 0;
-        let totalInstances = 0;
-        // cellStride deprecated: visual holes между skipped cells. Используем
-        // только squareStride через strideOffsets (entries pre-sorted в worker
-        // pack — первые N entries это stride-aligned). При sparse rendering
-        // sprites scaled × effectiveStride покрывают gaps "органически".
-        for (let cy = range.minY; cy <= range.maxY; cy++) {
-            for (let cx = range.minX; cx <= range.maxX; cx++) {
+        // === Phase 1: visibility test → собираем visible cells ===
+        // Phase 5.5: при K>0 cells stored at anchor coords (cellX % N == 0).
+        // Super-cell spans N×N base cells in world space. Iterate с step N.
+        const streamingK = this.streamingMgr?.getCurrentK() ?? 0;
+        const superN = 1 << streamingK;
+        const cellSpanSquares = cellSizeInSquares * superN;
+        type VisibleCell = {
+            cx: number;
+            cy: number;
+            offset: number;
+            entriesCount: number;
+            atlasLayer: number;
+            strideOffsets?: Uint32Array;
+        };
+        const visibleCells: VisibleCell[] = [];
+        // Align iteration к anchor: первая anchor cell = floor(minX/N)*N.
+        const iterStartCx = Math.floor(range.minX / superN) * superN;
+        const iterStartCy = Math.floor(range.minY / superN) * superN;
+        for (let cy = iterStartCy; cy <= range.maxY; cy += superN) {
+            for (let cx = iterStartCx; cx <= range.maxX; cx += superN) {
                 const info = this.cellTextureMgr.getCellInfo(cx, cy);
                 if (!info || info.length === 0) continue;
 
-                // Bounding box cell в pixel space (4 corners projected).
                 const cellOriginSx = cx * cellSizeInSquares;
                 const cellOriginSy = cy * cellSizeInSquares;
-                const cellEndSx = cellOriginSx + cellSizeInSquares;
-                const cellEndSy = cellOriginSy + cellSizeInSquares;
+                const cellEndSx = cellOriginSx + cellSpanSquares;
+                const cellEndSy = cellOriginSy + cellSpanSquares;
                 let minX: number;
                 let maxX: number;
                 let minY: number;
@@ -660,41 +742,93 @@ export class PzMapRenderer {
                 if (maxX < viewLeft || minX > viewRight) continue;
                 if (maxY < viewTop || minY > viewBottom) continue;
 
-                const entriesCount = info.length / 2;
-                // instanceCount = strideOffsets[K]: первые N entries
-                // pre-sorted в worker (stride-64 первыми, потом stride-32,
-                // ..., stride-1). drawArraysInstanced пропустит лишние
-                // entries полностью — vertex shader не выполняется для них.
-                const instanceCount = info.strideOffsets
-                    ? info.strideOffsets[strideBucketIdx]!
-                    : entriesCount;
-                if (instanceCount === 0) continue;
-                gl.uniform2f(u.uCellOriginSq!, cellOriginSx, cellOriginSy);
-                gl.uniform1ui(u.uCellOffsetInAtlas!, info.offset);
-                gl.drawArraysInstanced(
-                    gl.TRIANGLE_STRIP,
-                    0,
-                    4,
-                    instanceCount,
-                );
-                drawn++;
-                totalInstances += instanceCount;
+                visibleCells.push({
+                    cx,
+                    cy,
+                    offset: info.offset,
+                    // Compact 1-texel format (Phase 5.6): length = entries directly.
+                    entriesCount: info.length,
+                    atlasLayer: info.atlasLayer,
+                    strideOffsets: info.strideOffsets,
+                });
             }
+        }
+
+        // === Phase 2: Phase 5 auto-tune — bump K если instances > target ===
+        // ВАЖНО: при streamingK > 0 (super-cell mode) рендер К forced =
+        // streamingK. Super-pack хранит entries с encoded sx (= origSx/N),
+        // shader делает sx * uSquareStride. Несовпадение К → wrong positions.
+        const INSTANCE_TARGET = 2_000_000;
+        let renderK = streamingK > 0 ? streamingK : strideBucketIdx;
+        if (streamingK === 0) {
+            const sumAtK = (k: number): number => {
+                let s = 0;
+                for (const cell of visibleCells) {
+                    const raw = cell.strideOffsets
+                        ? cell.strideOffsets[k]!
+                        : cell.entriesCount;
+                    s += Math.min(raw, cell.entriesCount);
+                }
+                return s;
+            };
+            while (renderK < 6 && sumAtK(renderK) > INSTANCE_TARGET) {
+                renderK++;
+            }
+        }
+        // Update shader uniform: stride = 2^renderK.
+        const adjustedStride = 1 << renderK;
+        gl.uniform1i(u.uSquareStride!, adjustedStride);
+
+        // === Phase 3: draw visible cells на финальном renderK ===
+        // Phase 5.8: sort cells by atlasLayer + bind correct texture per group.
+        visibleCells.sort((a, b) => a.atlasLayer - b.atlasLayer);
+        let drawn = 0;
+        let totalInstances = 0;
+        let boundLayer = -1;
+        gl.activeTexture(gl.TEXTURE0);
+        for (const cell of visibleCells) {
+            const cellOriginSx = cell.cx * cellSizeInSquares;
+            const cellOriginSy = cell.cy * cellSizeInSquares;
+            const rawCount = cell.strideOffsets
+                ? cell.strideOffsets[renderK]!
+                : cell.entriesCount;
+            const instanceCount = Math.min(rawCount, cell.entriesCount);
+            if (instanceCount === 0) continue;
+            if (cell.atlasLayer !== boundLayer) {
+                const tex = this.cellTextureMgr.getAtlasTextureForLayer(cell.atlasLayer);
+                if (tex) {
+                    gl.bindTexture(gl.TEXTURE_2D, tex);
+                    boundLayer = cell.atlasLayer;
+                }
+            }
+            gl.uniform2f(u.uCellOriginSq!, cellOriginSx, cellOriginSy);
+            gl.uniform1ui(u.uCellOffsetInAtlas!, cell.offset);
+            gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
+            drawn++;
+            totalInstances += instanceCount;
         }
 
         gl.bindVertexArray(null);
         this.lastDrawnCellsCount = drawn;
         this.lastDrawnInstanceCount = totalInstances;
+        this.lastRenderK = renderK;
+
+        // Streaming disabled (был в Phase 4.4) — bulk loadAll режим.
     }
 
     /** Number of cells drawn в последнем frame (для HUD/debug). */
     private lastDrawnCellsCount = 0;
     private lastDrawnInstanceCount = 0;
+    private lastRenderK = 0;
     getLastDrawnCellsCount(): number {
         return this.lastDrawnCellsCount;
     }
     getLastDrawnInstanceCount(): number {
         return this.lastDrawnInstanceCount;
+    }
+    /** Phase 5: actual K used при render (may be bumped from requested). */
+    getLastRenderK(): number {
+        return this.lastRenderK;
     }
 
     private resizeCanvas(): void {
@@ -764,6 +898,54 @@ export class PzMapRenderer {
         return Math.min(ppsX, ppsY);
     }
 
+    /**
+     * Auto-fit pps на ВСЮ карту (все cells в cellRange). Используется
+     * для default view: пользователь сразу видит всю карту, может
+     * zoom-in.
+     */
+    computeAutoFitMapPps(): number {
+        const { canvas } = this.opts;
+        const w = canvas.clientWidth || canvas.width || 800;
+        const h = canvas.clientHeight || canvas.height || 600;
+        const { sqr, isometric } = this.debugView;
+        const range = this.getCellRange();
+        if (!range) return this.computeAutoFitPps();
+        const cellSizeInSquares = 256;
+        const sxRange = (range.maxX - range.minX + 1) * cellSizeInSquares;
+        const syRange = (range.maxY - range.minY + 1) * cellSizeInSquares;
+        let mapPxW: number;
+        let mapPxH: number;
+        if (isometric) {
+            // Iso diamond bounds: X spans ±(sxRange + syRange)/2 × sqr,
+            // Y spans (sxRange + syRange) × sqr/2.
+            // Total iso width = (sxRange + syRange) * sqr (диагональ ромба)
+            // Total iso height = (sxRange + syRange) * sqr / 2
+            mapPxW = (sxRange + syRange) * sqr;
+            mapPxH = (sxRange + syRange) * sqr * 0.5;
+        } else {
+            mapPxW = sxRange * sqr;
+            mapPxH = syRange * sqr;
+        }
+        const padding = 1.05;
+        const ppsX = w / (mapPxW * padding);
+        const ppsY = h / (mapPxH * padding);
+        return Math.min(ppsX, ppsY);
+    }
+
+    /**
+     * Iso pixel center всей карты (для default camera position).
+     * Возвращает (cellX, cellY) середины cellRange и (pixelX, pixelY)
+     * iso центра для информации.
+     */
+    computeMapCenter(): { cellX: number; cellY: number } | null {
+        const range = this.getCellRange();
+        if (!range) return null;
+        return {
+            cellX: Math.floor((range.minX + range.maxX) / 2),
+            cellY: Math.floor((range.minY + range.maxY) / 2),
+        };
+    }
+
     private setState(newState: RendererState): void {
         this.state = newState;
         this.progress.setState(newState);
@@ -805,7 +987,15 @@ export class PzMapRenderer {
             this.workerPool.dispose();
             this.workerPool = null;
         }
+        // Phase 6.3: clear references which might hold JS heap (Maps/Sets).
+        if (this.streamingMgr) {
+            this.streamingMgr.clear();
+            this.streamingMgr = null;
+        }
+        this.existingCellsSet = null;
         this.atlasTextures = null;
+        this.manifests = null;
+        this.cellStats = null;
         this.gl = null;
         this.state = 'idle';
     }

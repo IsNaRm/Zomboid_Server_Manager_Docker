@@ -18,6 +18,9 @@ uniform float uNativeSqr;         // px per square edge для которого 
 uniform int   uIsometric;         // 0 = top-down, 1 = isometric
 uniform int   uLod;               // 0..3, выбирает row band в spriteInfo
 uniform int   uNLods;             // = 4 (для расчёта sprite info row)
+uniform float uLodAtlasSize;      // px-размер ТЕКУЩЕГО LOD page (4096/2048/1024/512).
+                                  // Используется для half-pixel UV inset
+                                  // адаптивно к bound LOD.
 uniform float uAtlasNativeSize;   // px-размер LOD0 атласа (4096). Нужен
                                   // чтобы из нормализованного uvSize
                                   // получить native pixel width/height
@@ -40,9 +43,11 @@ uniform int   uSquareStride;      // decimation factor (= effective stride).
                                   // Здесь используется ТОЛЬКО для spriteScale
                                   // (sprite × stride чтобы покрыть gaps).
 
-// Cell atlas (R32UI): packed sprite stream всех cells.
+// Cell atlas (R32UI): packed sprite stream. Phase 5.8: separate per-region
+// textures с разными heights. Renderer binds correct texture перед draw.
+// Shader просто читает текущую binding'у.
 uniform highp usampler2D uCellAtlas;
-uniform int uCellAtlasWidth;     // ширина для index → ivec2 decode
+uniform int uCellAtlasWidth;     // width текущего bound atlas
 
 // Sprite metadata (RGBA32F).
 uniform sampler2D uSpriteInfo;
@@ -72,24 +77,20 @@ ivec2 atlasCoord(uint absIdx) {
 
 void main() {
     // 1. Fetch sprite entry для этого instance.
-    //    Каждая entry = 2 u32 texela: e0 (sprite_id + layer), e1 (sx, sy, z, flags).
-    uint absIdx = uCellOffsetInAtlas + uint(gl_InstanceID) * 2u;
-    uvec4 e0 = texelFetch(uCellAtlas, atlasCoord(absIdx),     0);
-    uvec4 e1 = texelFetch(uCellAtlas, atlasCoord(absIdx + 1u), 0);
+    //    Ground-only compact format: 1 u32 per entry.
+    //    Layout: sprite_id (16) | sx (8) | sy (8). layer/zStack/flags
+    //    всегда 0 в ground-only mode.
+    uint absIdx = uCellOffsetInAtlas + uint(gl_InstanceID);
+    uvec4 e = texelFetch(uCellAtlas, atlasCoord(absIdx), 0);
 
-    uint spriteId = e0.r & 0x00FFFFFFu;
-    int  layer    = int(e0.r >> 24) - 32;  // signed: PZ basement = -1, floors 0..7
-    uint sx = e1.r & 0xFFu;
-    uint sy = (e1.r >> 8) & 0xFFu;
-    uint zStack = (e1.r >> 16) & 0xFFu;
-    uint flags = (e1.r >> 24) & 0x7Fu;
+    uint spriteId = e.r & 0xFFFFu;
+    uint sx = (e.r >> 16) & 0xFFu;
+    uint sy = (e.r >> 24) & 0xFFu;
+    int  layer  = 0;
+    uint zStack = 0u;
+    uint flags  = 0u;
 
-    // Filter floors через UI slider: всё что выше uMaxFloor — скрыть.
-    // Делаем degenerate triangle через clip-space z=2 (вне [-1..1]).
-    if (layer > uMaxFloor) {
-        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-        return;
-    }
+    // uMaxFloor filter не нужен в ground-only mode (layer всегда 0).
 
     // Square stride decimation: фильтрация не нужна — worker pre-sorted
     // entries в stride buckets, CPU подаёт правильный instanceCount через
@@ -116,6 +117,9 @@ void main() {
     vec2 nativePx = uvSize * uAtlasNativeSize;
 
     // 3. World-square coord этого спрайта.
+    // Sprite sx/sy local to cell (0..255), worldSx = cellOrigin + sx.
+    // uSquareStride используется только для sprite scale (см. блок 5), НЕ
+    // для умножения координат — super-cell aggregation откатан.
     float worldSX = uCellOriginSq.x + float(sx);
     float worldSY = uCellOriginSq.y + float(sy);
 
@@ -173,9 +177,15 @@ void main() {
     vec2 corner = QUAD_CORNERS[gl_VertexID];
     vec2 cornerPx = spriteTopLeft + corner * nativePx * spriteScale;
 
-    // 6. UV: corner.y=0 = top of sprite quad = top of UV rect в atlas
-    //    (PIL Y-down convention). Standard mapping без flip.
-    vUv = uv0 + corner * uvSize;
+    // 6. UV inset для NEAREST sampling на границе sprite. Используем
+    //    half-pixel current LOD page (uLodAtlasSize), чтобы:
+    //    - LOD0 (4096): inset = 1/8192 normalized ≈ 0.00012 (~1.5% small sprite)
+    //    - LOD3 (512):  inset = 1/1024 normalized ≈ 0.00098 (адаптивно)
+    //    max(0) защищает от negative span на крошечных sprites.
+    vec2 pixelSize = vec2(1.0 / max(uLodAtlasSize, 1.0));
+    vec2 uvInner = uv0 + pixelSize * 0.5
+        + corner * max(uvSize - pixelSize, vec2(0.0));
+    vUv = uvInner;
     vAtlasPage = atlasPage;
     vAlpha = (flags & 0x40u) != 0u ? 0.5 : 1.0;  // halfWater flag
 

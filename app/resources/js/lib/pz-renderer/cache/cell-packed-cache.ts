@@ -26,7 +26,7 @@ export interface CachedPackedCell {
  * Bump'ить этот suffix если меняется bit layout packed entry, sort algorithm,
  * keepMinLayer/keepMaxLayer и т.п. — invalidate всех закэшированных cells.
  */
-const PACK_VERSION_SUFFIX = 'p2';
+const PACK_VERSION_SUFFIX = 'p5_g2';  // ground only, compact 1-texel entry format (forced cache rebuild)
 
 function cellKey(version: string, cellX: number, cellY: number): string {
     return `${version}_${PACK_VERSION_SUFFIX}_${cellX}_${cellY}`;

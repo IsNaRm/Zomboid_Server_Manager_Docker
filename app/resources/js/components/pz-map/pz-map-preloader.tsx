@@ -7,9 +7,10 @@ import type { ProgressSnapshot } from '@/lib/pz-renderer';
 
 interface Props {
     progress: ProgressSnapshot | null;
+    onCancel?: () => void;
 }
 
-export function PzMapPreloader({ progress }: Props) {
+export function PzMapPreloader({ progress, onCancel }: Props) {
     const pct = progress ? Math.round(progress.overall * 100) : 0;
     const label = progress?.label ?? 'Подключение...';
     const eta = progress?.details?.etaSeconds;
@@ -36,6 +37,17 @@ export function PzMapPreloader({ progress }: Props) {
                     Первая загрузка скачивает атлас и данные карты целиком.
                     Следующие визиты будут мгновенными благодаря кэшу в браузере.
                 </p>
+                {onCancel && (
+                    <div className="flex justify-center pt-2">
+                        <button
+                            type="button"
+                            onClick={onCancel}
+                            className="rounded border border-zinc-700 bg-zinc-800 px-4 py-1.5 text-xs font-medium text-zinc-300 transition hover:border-red-500 hover:bg-red-900/30 hover:text-red-300"
+                        >
+                            Отменить загрузку
+                        </button>
+                    </div>
+                )}
             </div>
         </div>
     );

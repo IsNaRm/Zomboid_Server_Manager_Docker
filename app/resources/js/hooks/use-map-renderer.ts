@@ -28,6 +28,8 @@ export interface UseMapRendererState {
     progress: ProgressSnapshot | null;
     error: Error | null;
     isReady: boolean;
+    /** Phase 6: отмена ongoing init. Сразу aborts workers, network, IDB. */
+    cancel: () => void;
 }
 
 const DEFAULT_ATLAS_URL = '/pz-atlas';
@@ -42,6 +44,7 @@ export function useMapRenderer(opts: UseMapRendererOptions): UseMapRendererState
     } = opts;
 
     const rendererRef = useRef<PzMapRenderer | null>(null);
+    const abortControllerRef = useRef<AbortController | null>(null);
     const [progress, setProgress] = useState<ProgressSnapshot | null>(null);
     const [error, setError] = useState<Error | null>(null);
     const [isReady, setIsReady] = useState(false);
@@ -52,6 +55,7 @@ export function useMapRenderer(opts: UseMapRendererOptions): UseMapRendererState
         if (!canvas) return;
 
         const controller = new AbortController();
+        abortControllerRef.current = controller;
         const rendererOpts: PzMapRendererOptions = {
             canvas,
             atlasBaseUrl,
@@ -74,10 +78,16 @@ export function useMapRenderer(opts: UseMapRendererOptions): UseMapRendererState
         };
     }, [enabled, atlasBaseUrl, cellsBaseUrl, canvasRef]);
 
+    const cancel = (): void => {
+        abortControllerRef.current?.abort();
+        setError(new Error('Cancelled by user'));
+    };
+
     return {
         renderer: rendererRef.current,
         progress,
         error,
         isReady,
+        cancel,
     };
 }

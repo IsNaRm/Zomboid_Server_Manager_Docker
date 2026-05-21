@@ -28,8 +28,12 @@ export function createTexture2dArray(
     if (!texture) throw new Error('[texture-2d-array] createTexture failed');
 
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
-    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    // NEAREST filter: PZ sprite art стилизован под pixel art. LINEAR
+    // mixes edge sprite pixel с соседним transparent pixel (rgb=0) →
+    // чёрная обводка вокруг sprites. NEAREST убирает halo, edges
+    // остаются sharp (pixel-perfect — родной стиль PZ).
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 

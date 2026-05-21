@@ -32,87 +32,221 @@ export interface CellTextureManagerOptions {
     /** Origin cell coords (если карта имеет cells в отрицательных координатах). */
     originCellX: number;
     originCellY: number;
+    /**
+     * Phase 5.8: per-region atlas heights. Каждый region (rect) имеет
+     * own TEXTURE_2D с heights[i] высоты. Width общий (atlasWidth).
+     * Renderer переключает binding между textures для разных regions.
+     * Per-region size позволяет minimize VRAM use (large region = tall
+     * texture, small region = short).
+     */
+    atlasHeights: ReadonlyArray<number>;
+    /**
+     * Region rects из rect_cover (port pzmap2dzi). `[x, y, w, h]` в cell
+     * coordinates. Cell мaпится на layer = index первого rect содержащего её.
+     */
+    regionRects: ReadonlyArray<readonly [number, number, number, number]>;
 }
 
 export interface CellTextureInfo {
+    /** Per-region atlas textures. Bind correct one based on cell's layer. */
+    cellAtlases: ReadonlyArray<WebGLTexture>;
+    /** Backward compat — points к первому atlas. */
     cellAtlas: WebGLTexture;
     cellIndex: WebGLTexture;
     atlasWidth: number;
-    atlasHeight: number;
+    /** Per-region heights (same length как cellAtlases). */
+    atlasHeights: ReadonlyArray<number>;
     indexGridWidth: number;
     indexGridHeight: number;
     originCellX: number;
     originCellY: number;
-    /** Сколько entries реально занято в cellAtlas (для статистики). */
+    /** Сколько entries реально занято во всех atlases (для статистики). */
     totalEntries: number;
+}
+
+/**
+ * Fixed-size slot allocator для cellAtlas. Atlas разделён на N равных
+ * слотов, каждый достаточно большой для любой PZ cell (~252k max
+ * texels observed). Allocate возвращает первый free slot offset.
+ * Free помечает slot free. НИКАКОЙ фрагментации — слоты дискретные.
+ *
+ * Используется в streaming mode (Phase 4.4): allocate/free бесконечно
+ * без degradation.
+ */
+/**
+ * Variable-size allocator (free-list). Cells have wildly varying sizes
+ * (ground cell 5k..200k texels), fixed slots waste atlas space. Free-list
+ * с coalescing работает для bulk load (только allocate, no free →
+ * effectively linear cursor → нет фрагментации).
+ */
+function slotSizeForK(_k: number): number {
+    // Compat stub — не используется в текущем bulk-load режиме.
+    return 1024 * 1024;
+}
+
+/**
+ * Variable-size free-list allocator. Each free region described by
+ * {offset, length} в u32 texels. Allocate: first-fit, splits if larger.
+ * Free: insert + coalesce с adjacent regions.
+ *
+ * Для bulk loadAll (Phase 6): только allocate, no free — фрагментация
+ * не возникает (фактически cursor allocator). Каждая cell получает
+ * слот exactly её размера, без waste.
+ */
+class FreeListAllocator {
+    /** Free ranges, sorted by offset ascending. */
+    private free: Array<{ offset: number; length: number }> = [];
+    /** Stub compatibility — used by codepaths expecting "slotSize". */
+    readonly slotSize: number = 0;
+
+    constructor(totalCapacity: number) {
+        this.free.push({ offset: 0, length: totalCapacity });
+    }
+
+    allocate(length: number): number {
+        for (let i = 0; i < this.free.length; i++) {
+            const r = this.free[i]!;
+            if (r.length >= length) {
+                const offset = r.offset;
+                if (r.length === length) {
+                    this.free.splice(i, 1);
+                } else {
+                    r.offset += length;
+                    r.length -= length;
+                }
+                return offset;
+            }
+        }
+        return -1;
+    }
+
+    free_(offset: number, length: number): void {
+        if (length === 0) return;
+        let i = 0;
+        while (i < this.free.length && this.free[i]!.offset < offset) i++;
+        const prev = i > 0 ? this.free[i - 1]! : null;
+        const next = i < this.free.length ? this.free[i]! : null;
+        const mergePrev = prev !== null && prev.offset + prev.length === offset;
+        const mergeNext = next !== null && offset + length === next.offset;
+        if (mergePrev && mergeNext) {
+            prev.length += length + next!.length;
+            this.free.splice(i, 1);
+        } else if (mergePrev) {
+            prev.length += length;
+        } else if (mergeNext) {
+            next!.offset = offset;
+            next!.length += length;
+        } else {
+            this.free.splice(i, 0, { offset, length });
+        }
+    }
+
+    freeBytes(): number {
+        let total = 0;
+        for (const r of this.free) total += r.length;
+        return total;
+    }
+
+    largestFreeRun(): number {
+        let max = 0;
+        for (const r of this.free) if (r.length > max) max = r.length;
+        return max;
+    }
+
+    usedSlotCount(): number {
+        return 0; // не tracked для variable-size
+    }
+}
+
+// Type alias для остального кода (use FreeListAllocator).
+type SlotAllocator = FreeListAllocator;
+// eslint-disable-next-line @typescript-eslint/no-redeclare
+const SlotAllocator = FreeListAllocator;
+
+/**
+ * Phase 5.7: per-layer info. Cell stored в specific atlas layer.
+ */
+interface CellSlotInfo {
+    atlasLayer: number;
+    offset: number;
+    length: number;
+    strideOffsets?: Uint32Array;
 }
 
 export class CellTextureManager {
     private readonly gl: WebGL2RenderingContext;
     private readonly opts: CellTextureManagerOptions;
-    private cellAtlas: WebGLTexture;
+    /** Phase 5.8: separate TEXTURE_2D per region. Different heights. */
+    private cellAtlases: WebGLTexture[];
+    /** Vestigial — kept для compat. */
     private cellIndex: WebGLTexture;
-    /** Текущий cursor в cellAtlas (в u32 индексах). */
-    private cursor = 0;
-    /** Staging для cellIndex: 2 u32 per cell (offset, length). */
-    private readonly indexData: Uint32Array;
-    /** Pending batches для cellAtlas (FIFO flush в RAF). */
-    private pendingAtlasUploads: Array<{
-        offset: number;
-        data: Uint32Array;
-    }> = [];
-    /** Пометка какие cells были appended (для commit cellIndex). */
-    private pendingIndexUpdates: Array<{ x: number; y: number }> = [];
-    /**
-     * Per-cell stride bucket offsets. Key = localY × indexGridWidth + localX.
-     * Value = Uint32Array(7) где [K] = cumulative entries with strideLevel ≥ K.
-     * Render использует это для drawArraysInstanced(..., strideOffsets[K]).
-     */
-    private readonly strideOffsetsByCell = new Map<number, Uint32Array>();
+    /** Per-layer allocator. Capacity = atlasWidth × atlasHeights[i]. */
+    private allocators: SlotAllocator[];
+    private currentK = 0;
+    private cellSlots: Map<number, CellSlotInfo> = new Map();
+    private pendingUploadsPerLayer: Array<Array<{ offset: number; data: Uint32Array }>>;
 
     constructor(opts: CellTextureManagerOptions) {
         this.gl = opts.gl;
         this.opts = opts;
-        this.indexData = new Uint32Array(
-            opts.indexGridWidth * opts.indexGridHeight * 2,
-        );
 
-        const cellAtlas = this.gl.createTexture();
-        const cellIndex = this.gl.createTexture();
-        if (!cellAtlas || !cellIndex) {
-            throw new Error('[cell-texture] createTexture failed');
+        const layerCount = Math.max(1, opts.atlasHeights.length);
+        this.cellAtlases = [];
+        this.allocators = [];
+        this.pendingUploadsPerLayer = [];
+
+        for (let i = 0; i < layerCount; i++) {
+            const h = opts.atlasHeights[i]!;
+            const tex = this.gl.createTexture();
+            if (!tex) throw new Error('[cell-texture] createTexture failed');
+            this.gl.bindTexture(this.gl.TEXTURE_2D, tex);
+            this.gl.texStorage2D(
+                this.gl.TEXTURE_2D, 1, this.gl.R32UI, opts.atlasWidth, h,
+            );
+            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MIN_FILTER, this.gl.NEAREST);
+            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MAG_FILTER, this.gl.NEAREST);
+            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_S, this.gl.CLAMP_TO_EDGE);
+            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
+            this.cellAtlases.push(tex);
+            this.allocators.push(new SlotAllocator(opts.atlasWidth * h));
+            this.pendingUploadsPerLayer.push([]);
         }
-        this.cellAtlas = cellAtlas;
-        this.cellIndex = cellIndex;
-
-        // cellAtlas — R32UI 2D texture.
-        this.gl.bindTexture(this.gl.TEXTURE_2D, this.cellAtlas);
-        this.gl.texStorage2D(
-            this.gl.TEXTURE_2D,
-            1,
-            this.gl.R32UI,
-            opts.atlasWidth,
-            opts.atlasHeight,
-        );
-        this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MIN_FILTER, this.gl.NEAREST);
-        this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MAG_FILTER, this.gl.NEAREST);
-        this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_S, this.gl.CLAMP_TO_EDGE);
-        this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
-
-        // cellIndex — RG32UI 2D texture.
-        this.gl.bindTexture(this.gl.TEXTURE_2D, this.cellIndex);
-        this.gl.texStorage2D(
-            this.gl.TEXTURE_2D,
-            1,
-            this.gl.RG32UI,
-            opts.indexGridWidth,
-            opts.indexGridHeight,
-        );
-        this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MIN_FILTER, this.gl.NEAREST);
-        this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MAG_FILTER, this.gl.NEAREST);
-        this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_S, this.gl.CLAMP_TO_EDGE);
-        this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
         this.gl.bindTexture(this.gl.TEXTURE_2D, null);
+
+        // cellIndex vestigial.
+        const idx = this.gl.createTexture();
+        if (!idx) throw new Error('[cell-texture] createTexture failed');
+        this.cellIndex = idx;
+        this.gl.bindTexture(this.gl.TEXTURE_2D, this.cellIndex);
+        this.gl.texStorage2D(this.gl.TEXTURE_2D, 1, this.gl.RG32UI, 1, 1);
+        this.gl.bindTexture(this.gl.TEXTURE_2D, null);
+    }
+
+    /**
+     * Phase 5.7: cell → layer mapping. Использует regionRects из PZ map
+     * config (computed через rect_cover algorithm). Cells в одном
+     * region rect — в одном atlas layer. Если cell не в одном из rects
+     * (или rects не заданы) — fallback на cellX range split.
+     */
+    private chooseLayerForCell(cellX: number, cellY: number): number {
+        const layerCount = this.allocators.length;
+        if (layerCount === 1) return 0;
+        const rects = this.opts.regionRects;
+        if (rects && rects.length > 0) {
+            for (let i = 0; i < rects.length; i++) {
+                const [rx, ry, rw, rh] = rects[i]!;
+                if (cellX >= rx && cellX < rx + rw
+                    && cellY >= ry && cellY < ry + rh) {
+                    return Math.min(i, layerCount - 1);
+                }
+            }
+            // Cell не в одном из rects — fallback layer 0.
+        }
+        // Fallback: split по cellX range равномерно.
+        const localX = cellX - this.opts.originCellX;
+        const span = Math.max(1, this.opts.indexGridWidth);
+        const layer = Math.floor((localX * layerCount) / span);
+        return Math.max(0, Math.min(layerCount - 1, layer));
     }
 
     /**
@@ -142,40 +276,91 @@ export class CellTextureManager {
             return false;
         }
 
-        const offset = this.cursor;
-        const length = packed.length;
-        const totalCapacity = this.opts.atlasWidth * this.opts.atlasHeight;
+        const cellKey = localY * this.opts.indexGridWidth + localX;
+        const uploadLength = packed.length;
 
-        const indexIdx = (localY * this.opts.indexGridWidth + localX) * 2;
-        this.pendingIndexUpdates.push({ x: localX, y: localY });
+        // Освободить старый slot если cell уже в atlas (для re-upload).
+        const existing = this.cellSlots.get(cellKey);
+        if (existing) {
+            this.allocators[existing.atlasLayer]!.free_(existing.offset, existing.length);
+            this.cellSlots.delete(cellKey);
+        }
 
-        if (offset + length > totalCapacity) {
-            // Overflow: помечаем cell как пустую (length=0), draw пропустит.
-            // Один раз логируем (повторные overflow в той же сессии нерелевантны).
+        if (uploadLength === 0) return true;
+
+        // Выбираем layer по region rect. Если переполнено, пробуем другие
+        // layers как fallback (на случай неравномерной плотности данных).
+        const preferredLayer = this.chooseLayerForCell(cellX, cellY);
+        let chosenLayer = -1;
+        let offset = -1;
+        // Try preferred first, then others as fallback.
+        for (let attempt = 0; attempt < this.allocators.length; attempt++) {
+            const layer = (preferredLayer + attempt) % this.allocators.length;
+            const o = this.allocators[layer]!.allocate(uploadLength);
+            if (o >= 0) {
+                chosenLayer = layer;
+                offset = o;
+                break;
+            }
+        }
+
+        if (chosenLayer < 0) {
             if (!this.overflowReported) {
                 this.overflowReported = true;
+                const stats = this.allocators.map((a, i) =>
+                    `L${i}: free=${a.freeBytes()}, max=${a.largestFreeRun()}`,
+                ).join('; ');
                 console.warn(
-                    `[cell-texture] atlas overflow: cell (${cellX},${cellY}) с ${length} entries не помещается. Capacity=${totalCapacity}, cursor=${offset}. Дальнейшие cells будут пропущены.`,
+                    `[cell-texture] no slot для cell (${cellX},${cellY}) length=${uploadLength}. ${stats}`,
                 );
             }
-            this.indexData[indexIdx] = 0;
-            this.indexData[indexIdx + 1] = 0;
             return false;
         }
 
-        this.indexData[indexIdx] = offset;
-        this.indexData[indexIdx + 1] = length;
-        if (length > 0) {
-            this.pendingAtlasUploads.push({ offset, data: packed });
-        }
-        if (strideOffsets) {
-            this.strideOffsetsByCell.set(
-                localY * this.opts.indexGridWidth + localX,
-                strideOffsets,
-            );
-        }
-        this.cursor += length;
+        this.cellSlots.set(cellKey, {
+            atlasLayer: chosenLayer,
+            offset,
+            length: uploadLength,
+            strideOffsets,
+        });
+        this.pendingUploadsPerLayer[chosenLayer]!.push({ offset, data: packed });
         return true;
+    }
+
+    /** Stub для backward compat (Phase 4.5 streaming не используется). */
+    recreateAllocatorForK(_k: number): void {
+        void slotSizeForK;
+    }
+
+    /** Текущий K — для diagnostics. */
+    getCurrentK(): number {
+        return this.currentK;
+    }
+
+    unload(cellX: number, cellY: number): boolean {
+        const localX = cellX - this.opts.originCellX;
+        const localY = cellY - this.opts.originCellY;
+        if (localX < 0 || localY < 0
+            || localX >= this.opts.indexGridWidth
+            || localY >= this.opts.indexGridHeight) return false;
+        const cellKey = localY * this.opts.indexGridWidth + localX;
+        const slot = this.cellSlots.get(cellKey);
+        if (!slot) return false;
+        this.allocators[slot.atlasLayer]!.free_(slot.offset, slot.length);
+        this.cellSlots.delete(cellKey);
+        this.overflowReported = false;
+        return true;
+    }
+
+    getAllocatorStats(): { free: number; largest: number; total: number } {
+        let free = 0, largest = 0, total = 0;
+        for (let i = 0; i < this.allocators.length; i++) {
+            free += this.allocators[i]!.freeBytes();
+            const l = this.allocators[i]!.largestFreeRun();
+            if (l > largest) largest = l;
+            total += this.opts.atlasWidth * this.opts.atlasHeights[i]!;
+        }
+        return { free, largest, total };
     }
 
     private overflowReported = false;
@@ -198,26 +383,25 @@ export class CellTextureManager {
     ): {
         offset: number;
         length: number;
+        atlasLayer: number;
         strideOffsets?: Uint32Array;
     } | null {
         const localX = cellX - this.opts.originCellX;
         const localY = cellY - this.opts.originCellY;
-        if (
-            localX < 0
-            || localY < 0
+        if (localX < 0 || localY < 0
             || localX >= this.opts.indexGridWidth
-            || localY >= this.opts.indexGridHeight
-        ) {
+            || localY >= this.opts.indexGridHeight) {
             return null;
         }
-        const idx = (localY * this.opts.indexGridWidth + localX) * 2;
-        const offset = this.indexData[idx]!;
-        const length = this.indexData[idx + 1]!;
-        if (length === 0) return null;
-        const strideOffsets = this.strideOffsetsByCell.get(
-            localY * this.opts.indexGridWidth + localX,
-        );
-        return { offset, length, strideOffsets };
+        const cellKey = localY * this.opts.indexGridWidth + localX;
+        const slot = this.cellSlots.get(cellKey);
+        if (!slot) return null;
+        return {
+            offset: slot.offset,
+            length: slot.length,
+            atlasLayer: slot.atlasLayer,
+            strideOffsets: slot.strideOffsets,
+        };
     }
 
     /**
@@ -233,44 +417,39 @@ export class CellTextureManager {
      * (это всего ~8 MB).
      */
     flush(): void {
-        if (this.pendingAtlasUploads.length > 0) {
-            this.gl.bindTexture(this.gl.TEXTURE_2D, this.cellAtlas);
-            // Pending uploads — contiguous (cursor increments через append).
-            // Coalesce в один staging Uint32Array.
-            const first = this.pendingAtlasUploads[0]!;
-            const startOffset = first.offset;
-            let totalLength = 0;
-            for (const b of this.pendingAtlasUploads) totalLength += b.data.length;
-            const staging = new Uint32Array(totalLength);
-            let pos = 0;
-            for (const b of this.pendingAtlasUploads) {
-                staging.set(b.data, pos);
-                pos += b.data.length;
+        for (let layer = 0; layer < this.pendingUploadsPerLayer.length; layer++) {
+            const pending = this.pendingUploadsPerLayer[layer]!;
+            if (pending.length === 0) continue;
+            this.gl.bindTexture(this.gl.TEXTURE_2D, this.cellAtlases[layer]!);
+            const sorted = [...pending].sort((a, b) => a.offset - b.offset);
+            let i = 0;
+            while (i < sorted.length) {
+                let j = i + 1;
+                let endOffset = sorted[i]!.offset + sorted[i]!.data.length;
+                while (j < sorted.length && sorted[j]!.offset === endOffset) {
+                    endOffset += sorted[j]!.data.length;
+                    j++;
+                }
+                if (j - i === 1) {
+                    this.uploadAtlasRange(sorted[i]!.offset, sorted[i]!.data);
+                } else {
+                    const total = endOffset - sorted[i]!.offset;
+                    const staging = new Uint32Array(total);
+                    let pos = 0;
+                    for (let k = i; k < j; k++) {
+                        staging.set(sorted[k]!.data, pos);
+                        pos += sorted[k]!.data.length;
+                    }
+                    this.uploadAtlasRange(sorted[i]!.offset, staging);
+                }
+                i = j;
             }
-            this.uploadAtlasRange(startOffset, staging);
-            this.pendingAtlasUploads.length = 0;
+            pending.length = 0;
         }
-
-        if (this.pendingIndexUpdates.length > 0) {
-            this.gl.bindTexture(this.gl.TEXTURE_2D, this.cellIndex);
-            this.gl.texSubImage2D(
-                this.gl.TEXTURE_2D,
-                0, // level
-                0, // xoffset
-                0, // yoffset
-                this.opts.indexGridWidth,
-                this.opts.indexGridHeight,
-                this.gl.RG_INTEGER,
-                this.gl.UNSIGNED_INT,
-                this.indexData,
-            );
-            this.pendingIndexUpdates.length = 0;
-        }
-
         this.gl.bindTexture(this.gl.TEXTURE_2D, null);
     }
 
-    /** Загрузить произвольный range в cellAtlas (offset в u32 → 2D rect). */
+    /** Upload в currently bound 2D texture. */
     private uploadAtlasRange(offset: number, data: Uint32Array): void {
         const W = this.opts.atlasWidth;
         let dataPos = 0;
@@ -280,20 +459,12 @@ export class CellTextureManager {
         while (remaining > 0) {
             const x = absOffset % W;
             const y = Math.floor(absOffset / W);
-            // Сколько texels можем загрузить в этой строке (от x до конца строки).
             const lineRemaining = W - x;
             const chunkLen = Math.min(remaining, lineRemaining);
             const chunk = data.subarray(dataPos, dataPos + chunkLen);
             this.gl.texSubImage2D(
-                this.gl.TEXTURE_2D,
-                0, // level
-                x,
-                y,
-                chunkLen,
-                1,
-                this.gl.RED_INTEGER,
-                this.gl.UNSIGNED_INT,
-                chunk,
+                this.gl.TEXTURE_2D, 0, x, y, chunkLen, 1,
+                this.gl.RED_INTEGER, this.gl.UNSIGNED_INT, chunk,
             );
             dataPos += chunkLen;
             absOffset += chunkLen;
@@ -301,25 +472,34 @@ export class CellTextureManager {
         }
     }
 
-    /** Текущая информация о текстурах (для shader binding). */
+    /** Получить texture для конкретного layer (для renderer binding). */
+    getAtlasTextureForLayer(layer: number): WebGLTexture | null {
+        return this.cellAtlases[layer] ?? null;
+    }
+
     getInfo(): CellTextureInfo {
+        let used = 0;
+        for (let i = 0; i < this.allocators.length; i++) {
+            used += this.opts.atlasWidth * this.opts.atlasHeights[i]! - this.allocators[i]!.freeBytes();
+        }
         return {
-            cellAtlas: this.cellAtlas,
+            cellAtlases: this.cellAtlases,
+            cellAtlas: this.cellAtlases[0]!, // compat first
             cellIndex: this.cellIndex,
             atlasWidth: this.opts.atlasWidth,
-            atlasHeight: this.opts.atlasHeight,
+            atlasHeights: this.opts.atlasHeights,
             indexGridWidth: this.opts.indexGridWidth,
             indexGridHeight: this.opts.indexGridHeight,
             originCellX: this.opts.originCellX,
             originCellY: this.opts.originCellY,
-            totalEntries: this.cursor / 2,
+            totalEntries: used,
         };
     }
 
     dispose(): void {
-        this.gl.deleteTexture(this.cellAtlas);
+        for (const t of this.cellAtlases) this.gl.deleteTexture(t);
         this.gl.deleteTexture(this.cellIndex);
-        this.pendingAtlasUploads.length = 0;
-        this.pendingIndexUpdates.length = 0;
+        for (const arr of this.pendingUploadsPerLayer) arr.length = 0;
+        this.cellSlots.clear();
     }
 }

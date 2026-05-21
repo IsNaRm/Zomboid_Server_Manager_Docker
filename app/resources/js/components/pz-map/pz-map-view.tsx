@@ -31,7 +31,7 @@ export function PzMapView({
     cellsBaseUrl,
 }: PzMapViewProps) {
     const canvasRef = useRef<HTMLCanvasElement>(null);
-    const { renderer, progress, error, isReady } = useMapRenderer({
+    const { renderer, progress, error, isReady, cancel } = useMapRenderer({
         canvasRef,
         atlasBaseUrl,
         cellsBaseUrl,
@@ -46,7 +46,7 @@ export function PzMapView({
     const [cellY, setCellY] = useState(0);
     const [cellLod, setCellLod] = useState(0);
     const [isometric, setIsometric] = useState(true);
-    const [sqr, setSqr] = useState(64);
+    const [sqr, setSqr] = useState(16);
     const [pps, setPps] = useState(1.0);
     const [maxFloor, setMaxFloor] = useState(3);
     const [floorHeightPx, setFloorHeightPx] = useState(192);
@@ -56,30 +56,41 @@ export function PzMapView({
     const [manualCellStride, setManualCellStride] = useState(1);
     const [manualSquareStride, setManualSquareStride] = useState(1);
 
+    // Stride-bucket packing использует только power-of-2 (K=0..6 →
+    // stride 1, 2, 4, 8). Non-power-of-2 значения дают gaps между
+    // tiles: при stride=3 worker берёт каждый 4-й (ближайший pow2),
+    // sprite scale=3, gap = 4-3=1 square. Snap to floor power-of-2.
+    // Max stride = 8 (укладывается в "максимум 12" constraint).
+    const snapStridePow2 = (v: number): number => {
+        if (v <= 1) return 1;
+        if (v >= 12) return 8;
+        return 2 ** Math.floor(Math.log2(v));
+    };
+
     // Auto LOD / stride на основании pps. Hysteresis: запоминаем
     // предыдущий level и переключаемся только если ушло за ±0.35
     // от boundary (≈3 wheel ticks).
     const tuningLevelRef = useRef(0);
     const tuning = useMemo(() => {
-        // Phase 4.3a: pack pre-sorted в stride buckets, поэтому squareStride
-        // даёт реальный instanceCount cut (vertex shader НЕ запускается для
-        // skipped sprites). cellStride deprecated — создавал visual holes.
-        // squareStride ∈ {1, 2, 4, 8, 16, 32, 64} — power-of-2, bucket index
-        // K = log2(stride).
+        // Auto-LOD: только адаптирует LOD атласа по pps. squareStride
+        // всегда 1 в auto mode — Phase 5 instance-driven bump делает
+        // реальный stride change. Эти два механизма раньше конфликтовали:
+        // tuning table делал stride change слишком рано, а Phase 5 bump
+        // (когда срабатывал) делал его правильно.
         const TABLE: Array<{ cellStride: number; squareStride: number; lod: number }> = [
             { cellStride: 1, squareStride: 1, lod: 0 },   // 0: pps ≥ 1.0
             { cellStride: 1, squareStride: 1, lod: 0 },   // 1: pps ≥ 0.5
-            { cellStride: 1, squareStride: 2, lod: 0 },   // 2: pps ≥ 0.25
-            { cellStride: 1, squareStride: 4, lod: 1 },   // 3: pps ≥ 0.125
-            { cellStride: 1, squareStride: 8, lod: 2 },   // 4: pps ≥ 0.0625
-            { cellStride: 1, squareStride: 16, lod: 3 },  // 5: pps ≥ 0.03
-            { cellStride: 1, squareStride: 32, lod: 3 },  // 6: pps ≥ 0.015
-            { cellStride: 1, squareStride: 64, lod: 3 },  // 7: pps < 0.015
+            { cellStride: 1, squareStride: 1, lod: 0 },   // 2: pps ≥ 0.25
+            { cellStride: 1, squareStride: 1, lod: 1 },   // 3: pps ≥ 0.125
+            { cellStride: 1, squareStride: 1, lod: 2 },   // 4: pps ≥ 0.0625
+            { cellStride: 1, squareStride: 1, lod: 3 },   // 5: pps ≥ 0.03
+            { cellStride: 1, squareStride: 1, lod: 3 },   // 6: pps ≥ 0.015
+            { cellStride: 1, squareStride: 1, lod: 3 },   // 7: pps < 0.015
         ];
         if (!autoTuning) {
             return {
                 cellStride: manualCellStride,
-                squareStride: manualSquareStride,
+                squareStride: snapStridePow2(manualSquareStride),
                 lod: cellLod,
                 level: -1,
             };
@@ -128,28 +139,34 @@ export function PzMapView({
         if (canvasRef.current) canvasRef.current.style.cursor = 'grab';
     };
 
-    // Wheel zoom: zoom вокруг точки под курсором (как Google/Leaflet).
-    // ΔY < 0 (scroll up) → zoom in. World position под cursor должен
-    // оставаться неподвижным: компенсируем pan через изменение 1/pps.
-    const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>): void => {
+    // Wheel zoom через native listener с { passive: false } чтобы
+    // preventDefault не блокировался браузером.
+    const wheelHandlerRef = useRef<((e: WheelEvent) => void) | null>(null);
+    wheelHandlerRef.current = (e: WheelEvent): void => {
+        if (mode !== 'cell') return;
         e.preventDefault();
         const canvas = canvasRef.current;
         if (!canvas) return;
         const rect = canvas.getBoundingClientRect();
         const mx = e.clientX - rect.left - rect.width / 2;
         const my = e.clientY - rect.top - rect.height / 2;
-        // 1.4x на tick: 5 кликов = 5.4× zoom (быстрее пробежать через
-        // все 8 уровней tuning). С Ctrl — 2.0× для ещё резкого jump.
         const baseFactor = e.ctrlKey ? 2.0 : 1.4;
         const factor = e.deltaY < 0 ? baseFactor : 1 / baseFactor;
         const oldPps = pps;
-        const newPps = Math.max(0.005, Math.min(8, oldPps * factor));
+        const newPps = Math.max(0.001, Math.min(8, oldPps * factor));
         if (newPps === oldPps) return;
         const dPan = 1 / oldPps - 1 / newPps;
         setPanX((px) => px + mx * dPan);
         setPanY((py) => py + my * dPan);
         setPps(newPps);
     };
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const handler = (e: WheelEvent): void => wheelHandlerRef.current?.(e);
+        canvas.addEventListener('wheel', handler, { passive: false });
+        return () => canvas.removeEventListener('wheel', handler);
+    }, []);
 
     // При смене mode/values — push в renderer.
     useEffect(() => {
@@ -218,20 +235,21 @@ export function PzMapView({
     };
 
     /**
-     * Auto-jump: при первом переключении в cell mode (после ready), если
-     * текущая cell пустая — найти первую непустую. Также авто-зумит
-     * чтобы cell поместилась в canvas (cell ≈ 16000 px wide на native
-     * zoom, default pps=1.0 показывает только малый угол).
+     * Auto-jump: при первом переключении в cell mode — центрируем
+     * camera на середину карты + auto-fit pps на всю карту целиком.
+     * Пользователь сразу видит всю карту, может zoom-in куда хочется.
      */
     const autoJumpedRef = useRef(false);
     useEffect(() => {
         if (!isReady || mode !== 'cell' || autoJumpedRef.current) return;
         if (!renderer || !cellRange) return;
-        if (renderer.getCellEntryCount(cellX, cellY) === 0) {
-            findNonEmpty();
+        const center = renderer.computeMapCenter();
+        if (center) {
+            setCellX(center.cellX);
+            setCellY(center.cellY);
         }
-        const fitPps = renderer.computeAutoFitPps();
-        if (fitPps > 0) setPps(Math.max(0.05, Math.min(8, fitPps)));
+        const fitPps = renderer.computeAutoFitMapPps();
+        if (fitPps > 0) setPps(Math.max(0.001, Math.min(8, fitPps)));
         autoJumpedRef.current = true;
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isReady, mode, renderer, cellRange]);
@@ -253,9 +271,8 @@ export function PzMapView({
                 onMouseMove={mode === 'cell' ? handleMouseMove : undefined}
                 onMouseUp={mode === 'cell' ? handleMouseUp : undefined}
                 onMouseLeave={mode === 'cell' ? handleMouseUp : undefined}
-                onWheel={mode === 'cell' ? handleWheel : undefined}
             />
-            {showPreloader && <PzMapPreloader progress={progress} />}
+            {showPreloader && <PzMapPreloader progress={progress} onCancel={cancel} />}
             {error && <PzMapError error={error} />}
             {isReady && (
                 <>
@@ -508,9 +525,16 @@ function DebugControls(p: DebugControlsProps) {
                                     label="squareStride"
                                     value={p.manualSquareStride}
                                     min={1}
-                                    max={64}
+                                    max={12}
                                     step={1}
                                     onChange={p.setManualSquareStride}
+                                    valueFmt={(v) => {
+                                        const eff
+                                            = v <= 1 ? 1
+                                                : v >= 12 ? 8
+                                                    : 2 ** Math.floor(Math.log2(v));
+                                        return `${v} → eff ${eff}`;
+                                    }}
                                 />
                             </>
                         )}
@@ -534,9 +558,9 @@ function DebugControls(p: DebugControlsProps) {
                     <Slider
                         label="zoom (pps mult)"
                         value={p.pps}
-                        min={0.005}
+                        min={0.001}
                         max={8}
-                        step={0.005}
+                        step={0.001}
                         onChange={p.setPps}
                         valueFmt={(v) =>
                             v >= 0.1 ? `${v.toFixed(1)}×` : `${v.toFixed(3)}×`
@@ -708,6 +732,7 @@ function CellStatsHud({ renderer }: { renderer: PzMapRenderer | null }) {
     const texInfo = renderer?.getCellTextureInfo();
     const [drawnCells, setDrawnCells] = useState(0);
     const [drawnInstances, setDrawnInstances] = useState(0);
+    const [renderK, setRenderK] = useState(0);
     const [fps, setFps] = useState(0);
     useEffect(() => {
         if (!renderer) return;
@@ -729,6 +754,7 @@ function CellStatsHud({ renderer }: { renderer: PzMapRenderer | null }) {
         const id = setInterval(() => {
             setDrawnCells(renderer.getLastDrawnCellsCount());
             setDrawnInstances(renderer.getLastDrawnInstanceCount());
+            setRenderK(renderer.getLastRenderK());
         }, 250);
         return () => {
             cancelAnimationFrame(raf);
@@ -737,7 +763,8 @@ function CellStatsHud({ renderer }: { renderer: PzMapRenderer | null }) {
     }, [renderer]);
     if (!stats || !texInfo) return null;
 
-    const mbAtlas = (texInfo.totalEntries * 8) / (1024 * 1024);
+    // Phase 5.6: compact 1-texel format — 4 bytes per entry (было 8 в legacy 2-texel).
+    const mbAtlas = (texInfo.totalEntries * 4) / (1024 * 1024);
     const cacheRatio = stats.bytesFromCache
         / Math.max(1, stats.bytesFromCache + stats.bytesFromNetwork);
     const fpsColor = fps >= 50 ? 'text-emerald-400' : fps >= 30 ? 'text-amber-400' : 'text-red-400';
@@ -745,7 +772,7 @@ function CellStatsHud({ renderer }: { renderer: PzMapRenderer | null }) {
     return (
         <div className="absolute bottom-3 left-3 z-[900] w-72 space-y-1 rounded-md border border-zinc-700 bg-zinc-900/90 p-3 font-mono text-[10px] text-zinc-300 backdrop-blur">
             <p className="text-[10px] uppercase tracking-wider text-emerald-400">
-                Phase 4.3a — stride-bucket sorted pack
+                Phase 5 — instance-driven auto stride
             </p>
             <div className="flex justify-between">
                 <span>FPS</span>
@@ -755,6 +782,12 @@ function CellStatsHud({ renderer }: { renderer: PzMapRenderer | null }) {
                 <span>Cells / instances drawn</span>
                 <span className="text-cyan-400">
                     {drawnCells} / {drawnInstances.toLocaleString()}
+                </span>
+            </div>
+            <div className="flex justify-between">
+                <span>render K (stride 2^K)</span>
+                <span className="text-amber-400">
+                    {renderK} (2^{renderK} = {1 << renderK})
                 </span>
             </div>
             <div className="flex justify-between">
