@@ -49,7 +49,7 @@ class ModController extends Controller
 
         return Inertia::render('admin/mods', [
             'mods' => $mods,
-            'protectedWorkshopIds' => ModManager::PROTECTED_WORKSHOP_IDS,
+            'protectedWorkshopIds' => array_keys(ModManager::PROTECTED_MODS),
             'pendingRestart' => $pendingRestart,
             'serverRunning' => $serverRunning,
         ]);

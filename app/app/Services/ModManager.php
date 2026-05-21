@@ -16,11 +16,6 @@ class ModManager
         '3685323705' => 'ZomboidManager',
     ];
 
-    /**
-     * @var list<string>
-     */
-    public const PROTECTED_WORKSHOP_IDS = ['3685323705'];
-
     public function __construct(
         private readonly ServerIniParser $iniParser,
     ) {}
