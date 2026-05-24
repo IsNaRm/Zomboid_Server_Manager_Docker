@@ -68,25 +68,14 @@ export class SaveWatcher {
         try {
             const manifest = await this.opts.loader.loadManifest();
             if (!manifest) return;
-            // Если версия совпадает — на сервере ничего не изменилось.
-            if (manifest.version === this.lastManifestVersion) {
-                return;
-            }
+            if (manifest.version === this.lastManifestVersion) return;
             this.lastManifestVersion = manifest.version;
 
-            // Дифф по mtime (loader держит loadedMtimes внутри, проверка дешёвая).
-            const highest = this.opts.loader.getHighestMtime();
-            const changed: Array<[number, number, number]> = [];
-            for (const cell of manifest.cells) {
-                if (cell[2] > highest) {
-                    changed.push(cell as [number, number, number]);
-                }
-            }
-            if (changed.length === 0) return;
+            const changedCount = await this.opts.loader.refreshChangedCells();
+            if (changedCount === 0) return;
 
-            await this.opts.loader.loadCells(changed);
             this.lastUpdateAt = Date.now();
-            this.opts.onUpdate?.(changed.length, this.lastUpdateAt);
+            this.opts.onUpdate?.(changedCount, this.lastUpdateAt);
         } catch (err) {
             if ((err as Error).name !== 'AbortError') {
                 console.warn('[save-watcher] tick failed:', err);

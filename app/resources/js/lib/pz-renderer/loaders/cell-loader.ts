@@ -85,6 +85,18 @@ export class CellLoader {
     private progressiveReadyFired = false;
     /** Phase 5.9: deferred packs (when deferAppend=true). */
     readonly deferredPacks: Map<string, { cellX: number; cellY: number; packed: Uint32Array; strideOffsets: Uint32Array }> = new Map();
+    /**
+     * Per-layer packs для слайдера этажей. Layer 0 уже uploaded в atlas как
+     * основной pack. Layers 1+ хранятся здесь до явного запроса
+     * `flushLayer(N)`. Key = `${cellX}_${cellY}_${layer}`.
+     */
+    readonly pendingLayerPacks: Map<string, {
+        cellX: number;
+        cellY: number;
+        layer: number;
+        packed: Uint32Array;
+        strideOffsets: Uint32Array;
+    }> = new Map();
 
     private maybeFireProgressiveReady(): void {
         if (this.progressiveReadyFired) return;
@@ -331,7 +343,8 @@ export class CellLoader {
         total: number,
     ): Promise<void> {
         // 0. Packed cache check: cells где уже есть готовый Uint32Array
-        //    skipping worker parse. Direct GPU append.
+        //    skipping worker parse. Direct GPU append. Per-layer cache:
+        //    layer 0 → atlas сразу, upper layers → pendingLayerPacks для slider.
         const stillNeedingParse: Array<[number, number]> = [];
         for (const [cx, cy] of batch) {
             const cached = await getCachedPackedCell(
@@ -347,6 +360,21 @@ export class CellLoader {
                 this.packedCacheHits++;
                 this.bytesFromCache
                     += cached.packed.byteLength + cached.strideOffsets.byteLength;
+                // Восстанавливаем upper layers (1..3) из cache для maxFloor slider.
+                if (cached.layers) {
+                    for (const lr of cached.layers) {
+                        if (lr.layer === 0 || lr.entriesCount === 0) continue;
+                        this.pendingLayerPacks.set(`${cx}_${cy}_${lr.layer}`, {
+                            cellX: cx,
+                            cellY: cy,
+                            layer: lr.layer,
+                            packed: new Uint32Array(lr.packed),
+                            strideOffsets: new Uint32Array(lr.strideOffsets),
+                        });
+                        this.bytesFromCache
+                            += lr.packed.byteLength + lr.strideOffsets.byteLength;
+                    }
+                }
                 this.opts.onCellProgress?.(
                     this.parsedCells + this.skippedCells,
                     total,
@@ -425,15 +453,35 @@ export class CellLoader {
                     );
                     const packed = new Uint32Array(result.packed);
                     const strideOffsets = new Uint32Array(result.strideOffsets);
-                    // Сохраняем в packed cache (fire-and-forget). IDB делает
-                    // structured clone на commit — для GPU upload buffer
-                    // остаётся валидным (texSubImage2D synchronous).
+                    // Per-layer cache: layer 0 + upper. На reload это даёт
+                    // мгновенный slider этажей без re-parse.
+                    const cachedLayers = result.perLayer?.map((lr) => ({
+                        layer: lr.layer,
+                        packed: lr.packed,
+                        strideOffsets: lr.strideOffsets,
+                        entriesCount: lr.entriesCount,
+                    }));
                     void putCachedPackedCell(this.opts.atlasVersion, cx, cy, {
                         packed: packed.buffer as ArrayBuffer,
                         strideOffsets: strideOffsets.buffer as ArrayBuffer,
                         entriesCount: result.entriesCount,
+                        layers: cachedLayers,
                     }).catch(() => {/* IDB quota — non-fatal */});
                     this.appendOrDefer(cx, cy, packed, strideOffsets);
+                    // Upper layers (1+) сохраняем для последующего upload
+                    // через flushLayer() — UI maxFloor slider grows lazy.
+                    if (result.perLayer) {
+                        for (const lr of result.perLayer) {
+                            if (lr.layer === 0 || lr.entriesCount === 0) continue;
+                            this.pendingLayerPacks.set(`${cx}_${cy}_${lr.layer}`, {
+                                cellX: cx,
+                                cellY: cy,
+                                layer: lr.layer,
+                                packed: new Uint32Array(lr.packed),
+                                strideOffsets: new Uint32Array(lr.strideOffsets),
+                            });
+                        }
+                    }
                     this.parsedCells++;
                     this.maybeFireProgressiveReady();
                 } catch (err) {
@@ -480,6 +528,36 @@ export class CellLoader {
         }
         textureMgr.flush();
         this.deferredPacks.clear();
+    }
+
+    /**
+     * Upload entries для конкретного PZ layer N (1..3) в base atlas. Каждый
+     * layer кодируется через виртуальный cellY = cellY + layer * stride —
+     * подход симметричный save-overlay. Idempotent.
+     */
+    flushLayer(layer: number, textureMgr: CellTextureManager, stride: number): number {
+        if (layer === 0) return 0;
+        let uploaded = 0;
+        const remaining: Array<string> = [];
+        for (const [key, slot] of this.pendingLayerPacks.entries()) {
+            if (slot.layer !== layer) continue;
+            const effectiveCellY = slot.cellY + layer * stride;
+            const ok = textureMgr.append(
+                slot.cellX,
+                effectiveCellY,
+                slot.packed,
+                slot.strideOffsets,
+            );
+            if (ok) {
+                uploaded++;
+                remaining.push(key);
+            }
+        }
+        for (const k of remaining) {
+            this.pendingLayerPacks.delete(k);
+        }
+        textureMgr.flush();
+        return uploaded;
     }
 
     /**

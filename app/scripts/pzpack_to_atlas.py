@@ -184,30 +184,61 @@ def reserve_mip_space(width: int, height: int, max_mip: int) -> tuple[int, int]:
 def pack_atlases(sprites: list, atlas_size: int, max_mip: int):
     """Bin-pack sprites into atlas pages with mip reservation.
 
-    Returns list of (rectpack.Rect, sprite_dict, mip_levels).
+    Uses **Online** packing (rectpack.PackingMode.Online): placement
+    выполняется при каждом add_rect → мы видим прогресс в реальном времени.
+    Sprites pre-sorted by area desc (largest first) чтобы compensate за
+    отсутствие Offline global optimization — density результат на ~5-10%
+    хуже Offline, но это компромисс за UX (real-time % progress).
+
+    Returns list of (bin_idx, rect, sprite_dict).
     """
-    packer = rectpack.newPacker(
-        mode=rectpack.PackingMode.Offline,
-        bin_algo=rectpack.PackingBin.BFF,
-        rotation=False,
-    )
-    # Sort by area (largest first) — improves bin-packing density significantly.
+    total = len(sprites)
+    t_sort_start = time.time()
+    print(f'  · sorting {total:,} sprites by area…', flush=True)
     sprites_sorted = sorted(
         sprites,
         key=lambda s: s['image'].size[0] * s['image'].size[1],
         reverse=True,
     )
+    print(f'  · sorted in {time.time() - t_sort_start:.1f}s', flush=True)
 
+    packer = rectpack.newPacker(
+        mode=rectpack.PackingMode.Online,
+        pack_algo=rectpack.MaxRectsBssf,
+        rotation=False,
+    )
+    # 64 bin upper limit — vanilla map needs ~10, mod packs ~30; never seen above 64.
+    packer.add_bin(atlas_size, atlas_size, count=64)
+
+    t_pack_start = time.time()
+    print(f'  · packing {total:,} sprites (online, real-time progress)…', flush=True)
+    added = 0
+    skipped = 0
+    last_print = t_pack_start
+    print_every_sec = 2.0
     for sprite in sprites_sorted:
         w, h = sprite['image'].size
         reserved_w, reserved_h, _ = reserve_mip_space(w, h, max_mip)
         if reserved_w > atlas_size or reserved_h > atlas_size:
-            print(f'  ! sprite {sprite["name"]} too big ({reserved_w}x{reserved_h}), skipped', file=sys.stderr)
+            print(f'  ! sprite {sprite["name"]} too big ({reserved_w}x{reserved_h}), skipped',
+                  file=sys.stderr, flush=True)
+            skipped += 1
             continue
         packer.add_rect(reserved_w, reserved_h, sprite)
-    # 64 bin upper limit — vanilla map needs ~10, mod packs ~30; never seen above 64.
-    packer.add_bin(atlas_size, atlas_size, count=64)
-    packer.pack()
+        added += 1
+        now = time.time()
+        if now - last_print >= print_every_sec or added == total - skipped:
+            elapsed = now - t_pack_start
+            pct = (added / max(1, total - skipped)) * 100
+            rate = added / elapsed if elapsed > 0 else 0
+            remaining = (total - skipped - added) / rate if rate > 0 else 0
+            print(f'  · packed {added:,}/{total - skipped:,} ({pct:5.1f}%) — '
+                  f'{elapsed:5.0f}s elapsed, ETA {remaining:5.0f}s, {rate:.0f} sprites/s',
+                  flush=True)
+            last_print = now
+
+    print(f'  · pack done in {time.time() - t_pack_start:.0f}s '
+          f'({added} placed, {skipped} too big)', flush=True)
 
     placements = []
     for bin_idx, abin in enumerate(packer):
@@ -412,9 +443,17 @@ def build_atlas(input_dir: Path, output_dir: Path, atlas_size: int, max_mip: int
     ]
 
     atlases_meta_unsorted: list[tuple[int, list, list]] = []
+    t_render_start = time.time()
+    completed = 0
+    total_pages = len(page_args)
     with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
         for result in executor.map(_render_one_page, page_args):
             atlases_meta_unsorted.append(result)
+            completed += 1
+            elapsed = time.time() - t_render_start
+            eta = (elapsed / completed) * (total_pages - completed) if completed > 0 else 0
+            print(f'  · progress: {completed}/{total_pages} pages — '
+                  f'{elapsed:.0f}s elapsed, ETA {eta:.0f}s', flush=True)
 
     # Deterministic ordering — manifest entries should be in page-id order
     # regardless of which worker completed when.

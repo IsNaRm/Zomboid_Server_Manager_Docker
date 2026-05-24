@@ -12,11 +12,13 @@
 
 import { BarChart3, Layers, Settings } from 'lucide-react';
 import type { SaveOverlayMode } from '@/lib/pz-renderer/types';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { AtlasMissingPanel } from './atlas-missing-panel';
 import { PzMapError } from './pz-map-error';
 import { PzMapPreloader } from './pz-map-preloader';
 import { PzTileMap, type DziSource } from './pz-tile-map';
+import { SaveFilterControls } from './save-filter-controls';
 import { useMapRenderer } from '@/hooks/use-map-renderer';
 import { useTranslation } from '@/hooks/use-translation';
 import type { PzMapRenderer } from '@/lib/pz-renderer';
@@ -76,6 +78,7 @@ export function PzMapView({
     const [showControls, setShowControls] = useState(false);
     const [showStats, setShowStats] = useState(false);
     const [saveOverlayMode, setSaveOverlayMode] = useState<SaveOverlayMode>('overlay');
+    const handleAtlasInstalled = useCallback(() => window.location.reload(), []);
     const { renderer, progress, error, isReady, cancel } = useMapRenderer({
         canvasRef,
         atlasBaseUrl,
@@ -94,7 +97,7 @@ export function PzMapView({
     const [isometric, setIsometric] = useState(true);
     const [sqr, setSqr] = useState(16);
     const [pps, setPps] = useState(1.0);
-    const [maxFloor, setMaxFloor] = useState(3);
+    const [maxFloor, setMaxFloor] = useState(0);
     const [floorHeightPx, setFloorHeightPx] = useState(192);
     const [panX, setPanX] = useState(0);
     const [panY, setPanY] = useState(0);
@@ -332,7 +335,11 @@ export function PzMapView({
                 />
             ) : null}
             {isWebgl && showPreloader && <PzMapPreloader progress={progress} onCancel={cancel} />}
-            {isWebgl && error && <PzMapError error={error} />}
+            {isWebgl && error && (
+                /atlas-not-built|manifest\.json|sprites\.json|HTTP 404|HTTP 503/i.test(error.message)
+                    ? <AtlasMissingPanel onInstalled={handleAtlasInstalled} />
+                    : <PzMapError error={error} />
+            )}
             <div className="absolute left-3 top-3 z-[900] flex max-h-[calc(100vh-1.5rem)] flex-col gap-2">
                 {showWebglUi && (
                     <>
@@ -437,6 +444,7 @@ export function PzMapView({
                         </div>
                     )}
                     {showStats && <CellStatsHud renderer={renderer} />}
+                    {showControls && <SaveFilterControls />}
                     </>
                 )}
             </div>
@@ -839,16 +847,20 @@ function CellStatsHud({ renderer }: { renderer: PzMapRenderer | null }) {
                         <span className="text-purple-300">{saveSnapshot.mode}</span>
                     </div>
                     <div className="flex justify-between">
-                        <span>Save cells</span>
+                        <span>Save slots loaded</span>
                         <span>
-                            {saveSnapshot.stats?.parsedCells ?? 0}
+                            {saveSnapshot.stats?.loadedSlots ?? 0}
                             {' / drawn '}
                             {drawnSaveCells}
                         </span>
                     </div>
                     <div className="flex justify-between">
+                        <span>Max loaded floor</span>
+                        <span>{saveSnapshot.stats?.loadedMaxLayer ?? 0}</span>
+                    </div>
+                    <div className="flex justify-between">
                         <span>Skipped</span>
-                        <span>{saveSnapshot.stats?.skippedCells ?? 0}</span>
+                        <span>{saveSnapshot.stats?.skippedSlots ?? 0}</span>
                     </div>
                     <div className="flex justify-between">
                         <span>PZ version</span>

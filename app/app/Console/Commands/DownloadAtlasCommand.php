@@ -95,9 +95,23 @@ class DownloadAtlasCommand extends Command
                 return self::FAILURE;
             }
 
-            // PharData может распаковать .tar.gz в один шаг.
-            $phar = new PharData($tmpFile);
-            $phar->extractTo($stagingDir, null, true);
+            // Стримим через системный tar чтобы не держать 700+ MB архив
+            // в PHP памяти (PharData загружает весь файл — упирается в memory_limit).
+            $tarCmd = sprintf(
+                'tar -xzf %s -C %s 2>&1',
+                escapeshellarg($tmpFile),
+                escapeshellarg($stagingDir),
+            );
+            $tarOutput = [];
+            $tarExit = 0;
+            exec($tarCmd, $tarOutput, $tarExit);
+            if ($tarExit !== 0) {
+                $this->error('tar -xzf завершилась с кодом '.$tarExit);
+                $this->line(implode("\n", array_slice($tarOutput, -10)));
+                $this->cleanup($tmpFile, $stagingDir);
+
+                return self::FAILURE;
+            }
 
             if (! is_file($stagingDir.'/manifest.json')) {
                 $this->error('В архиве нет manifest.json — формат неверный.');

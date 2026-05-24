@@ -16,17 +16,29 @@
 import { CELL_PACKED_STORE, idbGet, idbPut, openCacheDb } from './idb-cache';
 import { ensureVersionMatches } from '../utils/version';
 
-export interface CachedPackedCell {
+export interface CachedPackedLayer {
+    layer: number;
     packed: ArrayBuffer;
     strideOffsets: ArrayBuffer;
     entriesCount: number;
 }
 
+export interface CachedPackedCell {
+    /** Layer 0 для backward compat — те же байты что layers[0].packed. */
+    packed: ArrayBuffer;
+    strideOffsets: ArrayBuffer;
+    entriesCount: number;
+    /** Все распарсенные layers (0..3). Layer 0 идёт в base atlas изначально,
+     *  upper layers ждут flushLayer() при изменении maxFloor. */
+    layers?: CachedPackedLayer[];
+}
+
 /**
  * Bump'ить этот suffix если меняется bit layout packed entry, sort algorithm,
  * keepMinLayer/keepMaxLayer и т.п. — invalidate всех закэшированных cells.
+ * p6 = per-layer cache (layers 0..3 stored, slider этажей работает на reload).
  */
-const PACK_VERSION_SUFFIX = 'p5_g2';  // ground only, compact 1-texel entry format (forced cache rebuild)
+const PACK_VERSION_SUFFIX = 'p6_perlayer';
 
 function cellKey(version: string, cellX: number, cellY: number): string {
     return `${version}_${PACK_VERSION_SUFFIX}_${cellX}_${cellY}`;

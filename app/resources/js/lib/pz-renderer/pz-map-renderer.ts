@@ -104,6 +104,10 @@ export class PzMapRenderer {
     /** Manifest existing cells set — reused в визибилити вычислениях. */
     private existingCellsSet: Set<string> | null = null;
     private cellStats: CellLoaderStats | null = null;
+    /** Сохраняется после init для последующего flushLayer() при увеличении maxFloor. */
+    private cellLoader: CellLoader | null = null;
+    private baseLayerCellStride = 0;
+    private baseLoadedMaxLayer = 0;
 
     // === Save-game overlay state ===
     private saveCellTextureMgr: CellTextureManager | null = null;
@@ -112,6 +116,9 @@ export class PzMapRenderer {
     private saveOverlayMode: SaveOverlayMode = 'overlay';
     private saveStats: SaveCellLoaderStats | null = null;
     private saveLastUpdateAt: number | null = null;
+    private saveLayerCellStride = 0;
+    private saveRequestedMaxLayer = 0;
+    private saveLayerLoadInFlight = false;
 
     private state: RendererState = 'idle';
     private readonly progress: ProgressAggregator;
@@ -126,7 +133,7 @@ export class PzMapRenderer {
         isometric: true,
         sqr: 16,
         pps: 1.0,
-        maxFloor: 3,
+        maxFloor: 0,
         floorHeightPx: 192,
         panX: 0,
         panY: 0,
@@ -192,6 +199,37 @@ export class PzMapRenderer {
     setSaveOverlayMode(mode: SaveOverlayMode): void {
         this.saveOverlayMode = mode;
     }
+
+    /**
+     * Запросить загрузку save-cells до заданного этажа включительно.
+     * Default = 0 (только ground). При повышении подгружаются layer 1..N
+     * lazy для всех cells где manifest показывает данные.
+     */
+    ensureSaveLayersUpTo(maxLayer: number): void {
+        const clamped = Math.max(0, Math.min(3, maxLayer));
+        if (clamped <= this.saveRequestedMaxLayer) return;
+        this.saveRequestedMaxLayer = clamped;
+        void this.loadMissingSaveLayers();
+    }
+
+    private async loadMissingSaveLayers(): Promise<void> {
+        if (this.saveLayerLoadInFlight) return;
+        const loader = this.saveCellLoader;
+        if (!loader || !this.saveCellTextureMgr) return;
+        this.saveLayerLoadInFlight = true;
+        try {
+            const currentMaxLoaded = loader.getStats().loadedMaxLayer;
+            for (let l = currentMaxLoaded + 1; l <= this.saveRequestedMaxLayer; l++) {
+                await loader.loadLayer(l);
+                this.saveStats = loader.getStats();
+            }
+        } catch (err) {
+            console.warn('[renderer] save layer load failed:', err);
+        } finally {
+            this.saveLayerLoadInFlight = false;
+        }
+    }
+
 
     /**
      * Запустить полный init pipeline. Завершается переходом в 'ready'
@@ -340,6 +378,9 @@ export class PzMapRenderer {
             );
 
             // Compute exact texels per region (sum of packed.length).
+            // Включаем upper layers (1..3) которые лежат в pendingLayerPacks —
+            // даже если они uploaded позже через flushLayer(), atlas всё равно
+            // должен иметь физическое место под них.
             const regionTexels = new Array(regionRects.length).fill(0);
             const inRect = (rx: number, ry: number, rw: number, rh: number, cx: number, cy: number): boolean =>
                 cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh;
@@ -348,6 +389,15 @@ export class PzMapRenderer {
                     const [rx, ry, rw, rh] = regionRects[i]!;
                     if (inRect(rx, ry, rw, rh, pack.cellX, pack.cellY)) {
                         regionTexels[i] += pack.packed.length;
+                        break;
+                    }
+                }
+            }
+            for (const slot of preflightLoader.pendingLayerPacks.values()) {
+                for (let i = 0; i < regionRects.length; i++) {
+                    const [rx, ry, rw, rh] = regionRects[i]!;
+                    if (inRect(rx, ry, rw, rh, slot.cellX, slot.cellY)) {
+                        regionTexels[i] += slot.packed.length;
                         break;
                     }
                 }
@@ -367,23 +417,35 @@ export class PzMapRenderer {
                 return Math.min(aligned, ATLAS_HEIGHT);
             });
 
+            // indexGridHeight × 4 — виртуальное пространство для PZ layers
+            // (0..3). Upload каждого layer N идёт в slot (cellX, cellY + N * stride).
+            // Layer 0 загружается через flushDeferred, layers 1..3 — через
+            // flushLayer() по требованию слайдера maxFloor.
+            const baseLayerCellStride = indexGridHeight;
+            this.baseLayerCellStride = baseLayerCellStride;
+            const indexGridHeightExpanded = indexGridHeight * 4;
+            const regionRectsExpanded = regionRects.map(([rx, ry, rw, rh]) =>
+                [rx, ry, rw, rh * 4] as readonly [number, number, number, number],
+            );
+
             this.cellTextureMgr = new CellTextureManager({
                 gl: this.gl,
                 atlasWidth: ATLAS_WIDTH,
                 atlasHeight: ATLAS_HEIGHT,
                 indexGridWidth,
-                indexGridHeight,
+                indexGridHeight: indexGridHeightExpanded,
                 originCellX: minCx,
                 originCellY: minCy,
                 atlasHeights,
-                regionRects,
+                regionRects: regionRectsExpanded,
             });
 
-            // Flush deferred packs → atlas (synchronous, fast — packs в RAM).
+            // Flush deferred packs (layer 0) → atlas.
             preflightLoader.flushDeferred(this.cellTextureMgr);
 
             // Reuse stats (preflight уже parsed everything).
             const cellLoader = preflightLoader;
+            this.cellLoader = cellLoader;
 
             // firstReadyPromise resolves сразу — atlas заполнен.
             let firstReadyResolve!: () => void;
@@ -458,6 +520,7 @@ export class PzMapRenderer {
                     'uSquareStride',
                     'uIsSavePass',
                     'uHighlightChanges',
+                    'uForceLayer',
                 ],
             );
 
@@ -645,8 +708,11 @@ export class PzMapRenderer {
         gl.uniform1f(u.uSqr!, sqr);
         gl.uniform1f(u.uNativeSqr!, 64);
         // Save overlay uniforms — base pass всегда с isSavePass=0.
-        gl.uniform1ui(u.uIsSavePass!, 0);
-        gl.uniform1ui(u.uHighlightChanges!, 0);
+        gl.uniform1i(u.uIsSavePass!, 0);
+        gl.uniform1i(u.uHighlightChanges!, 0);
+        // -1 = use decoded layer from entry (всегда 0 для compact format).
+        // Save pass overridит для upper floors.
+        gl.uniform1i(u.uForceLayer!, -1);
         gl.uniform1i(u.uIsometric!, isometric ? 1 : 0);
         gl.uniform1i(u.uLod!, lod);
         gl.uniform1i(u.uNLods!, this.manifests.atlas.lods.length);
@@ -739,6 +805,8 @@ export class PzMapRenderer {
         // Align iteration к anchor: первая anchor cell = floor(minX/N)*N.
         const iterStartCx = Math.floor(range.minX / superN) * superN;
         const iterStartCy = Math.floor(range.minY / superN) * superN;
+        // pzmap2dzi-style: base рисует ВСЁ всегда. Save рисуется поверх через
+        // alpha + z-bias. Никаких skip — base даёт blends и full ground везде.
         for (let cy = iterStartCy; cy <= range.maxY; cy += superN) {
             for (let cx = iterStartCx; cx <= range.maxX; cx += superN) {
                 const info = this.cellTextureMgr.getCellInfo(cx, cy);
@@ -817,33 +885,44 @@ export class PzMapRenderer {
         gl.uniform1i(u.uSquareStride!, adjustedStride);
 
         // === Phase 3: draw visible cells на финальном renderK ===
-        // Phase 5.8: sort cells by atlasLayer + bind correct texture per group.
+        // Iterate PZ layers 0..maxFloor чтобы upper-floor sprites сдвигались
+        // вверх через uFloorHeightPx × layer в vertex shader.
         visibleCells.sort((a, b) => a.atlasLayer - b.atlasLayer);
         let drawn = 0;
         let totalInstances = 0;
         let boundLayer = -1;
         gl.activeTexture(gl.TEXTURE0);
-        for (const cell of visibleCells) {
-            const cellOriginSx = cell.cx * cellSizeInSquares;
-            const cellOriginSy = cell.cy * cellSizeInSquares;
-            const rawCount = cell.strideOffsets
-                ? cell.strideOffsets[renderK]!
-                : cell.entriesCount;
-            const instanceCount = Math.min(rawCount, cell.entriesCount);
-            if (instanceCount === 0) continue;
-            if (cell.atlasLayer !== boundLayer) {
-                const tex = this.cellTextureMgr.getAtlasTextureForLayer(cell.atlasLayer);
-                if (tex) {
-                    gl.bindTexture(gl.TEXTURE_2D, tex);
-                    boundLayer = cell.atlasLayer;
+        const baseStride = this.baseLayerCellStride;
+        for (let pzLayer = 0; pzLayer <= maxFloor && pzLayer <= 3; pzLayer++) {
+            gl.uniform1i(u.uForceLayer!, pzLayer);
+            for (const cell of visibleCells) {
+                let info = pzLayer === 0
+                    ? { offset: cell.offset, length: cell.entriesCount, atlasLayer: cell.atlasLayer, strideOffsets: cell.strideOffsets }
+                    : this.cellTextureMgr.getCellInfo(cell.cx, cell.cy + pzLayer * baseStride);
+                if (!info || info.length === 0) continue;
+
+                const cellOriginSx = cell.cx * cellSizeInSquares;
+                const cellOriginSy = cell.cy * cellSizeInSquares;
+                const rawCount = info.strideOffsets
+                    ? info.strideOffsets[renderK]!
+                    : info.length;
+                const instanceCount = Math.min(rawCount, info.length);
+                if (instanceCount === 0) continue;
+                if (info.atlasLayer !== boundLayer) {
+                    const tex = this.cellTextureMgr.getAtlasTextureForLayer(info.atlasLayer);
+                    if (tex) {
+                        gl.bindTexture(gl.TEXTURE_2D, tex);
+                        boundLayer = info.atlasLayer;
+                    }
                 }
+                gl.uniform2f(u.uCellOriginSq!, cellOriginSx, cellOriginSy);
+                gl.uniform1ui(u.uCellOffsetInAtlas!, info.offset);
+                gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
+                drawn++;
+                totalInstances += instanceCount;
             }
-            gl.uniform2f(u.uCellOriginSq!, cellOriginSx, cellOriginSy);
-            gl.uniform1ui(u.uCellOffsetInAtlas!, cell.offset);
-            gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
-            drawn++;
-            totalInstances += instanceCount;
         }
+        gl.uniform1i(u.uForceLayer!, -1);
 
         // === Save-overlay pass ===
         // depthFunc(LEQUAL) уже включён выше — save sprites побеждают base
@@ -898,7 +977,29 @@ export class PzMapRenderer {
      * Leaflet рендером карты.
      */
     setDebugView(view: Partial<DebugViewState>): void {
-        this.debugView = { ...this.debugView, ...view };
+        const prev = this.debugView;
+        this.debugView = { ...prev, ...view };
+        if (view.maxFloor !== undefined && view.maxFloor > prev.maxFloor) {
+            this.ensureSaveLayersUpTo(view.maxFloor);
+            this.ensureBaseLayersUpTo(view.maxFloor);
+        }
+    }
+
+    /**
+     * Upload base map upper-layer entries (1..N) в cellTextureMgr. Workers
+     * парсят все layers сразу при init, но в atlas изначально кладётся только
+     * layer 0. Этажи 1+ ждут в pendingLayerPacks до этого вызова.
+     */
+    private ensureBaseLayersUpTo(maxLayer: number): void {
+        if (!this.cellLoader || !this.cellTextureMgr) return;
+        const target = Math.max(0, Math.min(3, maxLayer));
+        for (let l = this.baseLoadedMaxLayer + 1; l <= target; l++) {
+            const uploaded = this.cellLoader.flushLayer(
+                l, this.cellTextureMgr, this.baseLayerCellStride,
+            );
+            console.info(`[renderer] base layer ${l} uploaded: ${uploaded} cells`);
+        }
+        this.baseLoadedMaxLayer = Math.max(this.baseLoadedMaxLayer, target);
     }
 
     /** Текущий snapshot debug view (для UI controls). */
@@ -1012,15 +1113,20 @@ export class PzMapRenderer {
         const baseInfo = this.cellTextureMgr.getInfo();
         const saveBaseUrl = this.opts.saveBaseUrl ?? '/pz-save-data';
 
-        // Один прямоугольник на весь cell range — save data разрежены,
-        // одного atlas обычно достаточно.
+        // Atlas: индексируем по effectiveCellY = cellY + layer * layerCellStride.
+        // Это позволяет хранить entries для разных layers одной и той же cell
+        // в разных слотах одного atlas. layerCellStride должен быть >= ширины
+        // cell range, чтобы layer 1 не пересекался с layer 0.
+        const layerCellStride = baseInfo.indexGridHeight;
         const ATLAS_WIDTH = Math.min(2048, this.capabilities.maxTextureSize);
-        const ATLAS_HEIGHT = Math.min(4096, this.capabilities.maxTextureSize);
+        const ATLAS_HEIGHT = Math.min(8192, this.capabilities.maxTextureSize);
+        // indexGridHeight × MAX_LAYERS (4) для виртуальной грид-расширения.
+        const indexGridHeightExpanded = baseInfo.indexGridHeight * 4;
         const regionRect: readonly [number, number, number, number] = [
             baseInfo.originCellX,
             baseInfo.originCellY,
             baseInfo.indexGridWidth,
-            baseInfo.indexGridHeight,
+            indexGridHeightExpanded,
         ];
 
         this.saveCellTextureMgr = new CellTextureManager({
@@ -1028,7 +1134,7 @@ export class PzMapRenderer {
             atlasWidth: ATLAS_WIDTH,
             atlasHeight: ATLAS_HEIGHT,
             indexGridWidth: baseInfo.indexGridWidth,
-            indexGridHeight: baseInfo.indexGridHeight,
+            indexGridHeight: indexGridHeightExpanded,
             originCellX: baseInfo.originCellX,
             originCellY: baseInfo.originCellY,
             atlasHeights: [ATLAS_HEIGHT],
@@ -1038,20 +1144,23 @@ export class PzMapRenderer {
         this.saveCellLoader = new SaveCellLoader({
             textureMgr: this.saveCellTextureMgr,
             saveBaseUrl,
+            layerCellStride,
             signal: this.opts.signal,
         });
+        this.saveLayerCellStride = layerCellStride;
 
         const initialManifest = await this.saveCellLoader.loadManifest();
         if (!initialManifest) {
             console.info('[renderer] save-overlay: no manifest yet (server cache not built)');
             this.saveStats = this.saveCellLoader.getStats();
         } else {
-            await this.saveCellLoader.loadCells(initialManifest.cells);
+            // По дефолту только layer 0. Upper floors грузятся через
+            // ensureSaveLayersUpTo() когда пользователь крутит maxFloor.
+            await this.saveCellLoader.loadInitial();
             this.saveCellTextureMgr.flush();
             this.saveStats = this.saveCellLoader.getStats();
             console.info(
-                `[renderer] save-overlay loaded: ${this.saveStats.parsedCells} cells `
-                + `(skipped ${this.saveStats.skippedCells}), `
+                `[renderer] save-overlay layer 0 loaded: ${this.saveStats.loadedSlots} cells, `
                 + `save_version=B${this.saveStats.saveVersion ?? '?'}`,
             );
         }
@@ -1064,7 +1173,7 @@ export class PzMapRenderer {
                 if (this.saveCellLoader) {
                     this.saveStats = this.saveCellLoader.getStats();
                 }
-                console.info(
+                    console.info(
                     `[renderer] save-overlay updated: ${changedCells} cells changed`,
                 );
             },
@@ -1100,11 +1209,8 @@ export class PzMapRenderer {
         const gl = this.gl;
         const u = this.mainProgram.uniforms;
 
-        gl.uniform1ui(
-            u.uIsSavePass!,
-            1,
-        );
-        gl.uniform1ui(
+        gl.uniform1i(u.uIsSavePass!, 1);
+        gl.uniform1i(
             u.uHighlightChanges!,
             this.saveOverlayMode === 'highlight' ? 1 : 0,
         );
@@ -1126,69 +1232,81 @@ export class PzMapRenderer {
             return;
         }
 
-        let boundLayer = -1;
+        let boundAtlasLayer = -1;
         let drawnSave = 0;
-        for (let cy = range.minY; cy <= range.maxY; cy++) {
-            for (let cx = range.minX; cx <= range.maxX; cx++) {
-                const info = this.saveCellTextureMgr.getCellInfo(cx, cy);
-                if (!info || info.length === 0) continue;
+        const maxFloor = this.debugView.maxFloor;
+        const layerStride = this.saveLayerCellStride;
+        // Iterate layers 0..maxFloor чтобы upper-floor sprites сдвигались
+        // вверх через uFloorHeightPx × layer в vertex shader.
+        for (let pzLayer = 0; pzLayer <= maxFloor && pzLayer <= 3; pzLayer++) {
+            gl.uniform1i(u.uForceLayer!, pzLayer);
+            for (let cy = range.minY; cy <= range.maxY; cy++) {
+                for (let cx = range.minX; cx <= range.maxX; cx++) {
+                    const effectiveCy = cy + pzLayer * layerStride;
+                    const info = this.saveCellTextureMgr.getCellInfo(cx, effectiveCy);
+                    if (!info || info.length === 0) continue;
 
-                const cellOriginSx = cx * cellSizeInSquares;
-                const cellOriginSy = cy * cellSizeInSquares;
-                const cellEndSx = cellOriginSx + cellSizeInSquares;
-                const cellEndSy = cellOriginSy + cellSizeInSquares;
-                let minX: number;
-                let maxX: number;
-                let minY: number;
-                let maxY: number;
-                if (isometric) {
-                    const h2 = sqr * 0.5;
-                    const c1x = (cellOriginSx - cellOriginSy) * sqr;
-                    const c2x = (cellEndSx - cellOriginSy) * sqr;
-                    const c3x = (cellOriginSx - cellEndSy) * sqr;
-                    const c4x = (cellEndSx - cellEndSy) * sqr;
-                    const c1y = (cellOriginSx + cellOriginSy) * h2;
-                    const c2y = (cellEndSx + cellOriginSy) * h2;
-                    const c3y = (cellOriginSx + cellEndSy) * h2;
-                    const c4y = (cellEndSx + cellEndSy) * h2;
-                    minX = Math.min(c1x, c2x, c3x, c4x) - padding;
-                    maxX = Math.max(c1x, c2x, c3x, c4x) + padding;
-                    minY = Math.min(c1y, c2y, c3y, c4y) - padding;
-                    maxY = Math.max(c1y, c2y, c3y, c4y) + padding;
-                } else {
-                    minX = cellOriginSx * sqr - padding;
-                    maxX = cellEndSx * sqr + padding;
-                    minY = cellOriginSy * sqr - padding;
-                    maxY = cellEndSy * sqr + padding;
-                }
-                if (maxX < viewLeft || minX > viewRight) continue;
-                if (maxY < viewTop || minY > viewBottom) continue;
-
-                const rawCount = info.strideOffsets
-                    ? info.strideOffsets[renderK]!
-                    : info.length;
-                const instanceCount = Math.min(rawCount, info.length);
-                if (instanceCount === 0) continue;
-
-                if (info.atlasLayer !== boundLayer) {
-                    const tex = this.saveCellTextureMgr.getAtlasTextureForLayer(
-                        info.atlasLayer,
-                    );
-                    if (tex) {
-                        gl.bindTexture(gl.TEXTURE_2D, tex);
-                        boundLayer = info.atlasLayer;
+                    const cellOriginSx = cx * cellSizeInSquares;
+                    const cellOriginSy = cy * cellSizeInSquares;
+                    const cellEndSx = cellOriginSx + cellSizeInSquares;
+                    const cellEndSy = cellOriginSy + cellSizeInSquares;
+                    let minX: number;
+                    let maxX: number;
+                    let minY: number;
+                    let maxY: number;
+                    if (isometric) {
+                        const h2 = sqr * 0.5;
+                        const c1x = (cellOriginSx - cellOriginSy) * sqr;
+                        const c2x = (cellEndSx - cellOriginSy) * sqr;
+                        const c3x = (cellOriginSx - cellEndSy) * sqr;
+                        const c4x = (cellEndSx - cellEndSy) * sqr;
+                        const c1y = (cellOriginSx + cellOriginSy) * h2;
+                        const c2y = (cellEndSx + cellOriginSy) * h2;
+                        const c3y = (cellOriginSx + cellEndSy) * h2;
+                        const c4y = (cellEndSx + cellEndSy) * h2;
+                        minX = Math.min(c1x, c2x, c3x, c4x) - padding;
+                        maxX = Math.max(c1x, c2x, c3x, c4x) + padding;
+                        minY = Math.min(c1y, c2y, c3y, c4y) - padding;
+                        maxY = Math.max(c1y, c2y, c3y, c4y) + padding;
+                        // Upper floors сдвигаются вверх по экрану:
+                        // расширяем bounding box вверх чтобы не отсечь cells на границе viewport.
+                        minY -= pzLayer * this.debugView.floorHeightPx;
+                    } else {
+                        minX = cellOriginSx * sqr - padding;
+                        maxX = cellEndSx * sqr + padding;
+                        minY = cellOriginSy * sqr - padding;
+                        maxY = cellEndSy * sqr + padding;
                     }
+                    if (maxX < viewLeft || minX > viewRight) continue;
+                    if (maxY < viewTop || minY > viewBottom) continue;
+
+                    const rawCount = info.strideOffsets
+                        ? info.strideOffsets[renderK]!
+                        : info.length;
+                    const instanceCount = Math.min(rawCount, info.length);
+                    if (instanceCount === 0) continue;
+
+                    if (info.atlasLayer !== boundAtlasLayer) {
+                        const tex = this.saveCellTextureMgr.getAtlasTextureForLayer(
+                            info.atlasLayer,
+                        );
+                        if (tex) {
+                            gl.bindTexture(gl.TEXTURE_2D, tex);
+                            boundAtlasLayer = info.atlasLayer;
+                        }
+                    }
+                    gl.uniform2f(u.uCellOriginSq!, cellOriginSx, cellOriginSy);
+                    gl.uniform1ui(u.uCellOffsetInAtlas!, info.offset);
+                    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
+                    drawnSave++;
                 }
-                gl.uniform2f(u.uCellOriginSq!, cellOriginSx, cellOriginSy);
-                gl.uniform1ui(u.uCellOffsetInAtlas!, info.offset);
-                gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
-                drawnSave++;
             }
         }
 
         // Сбрасываем uniforms для следующего frame.
-        gl.uniform1ui(u.uIsSavePass!, 0);
-        gl.uniform1ui(u.uHighlightChanges!, 0);
+        gl.uniform1i(u.uIsSavePass!, 0);
+        gl.uniform1i(u.uHighlightChanges!, 0);
+        gl.uniform1i(u.uForceLayer!, -1);
         this.lastDrawnSaveCells = drawnSave;
     }
 

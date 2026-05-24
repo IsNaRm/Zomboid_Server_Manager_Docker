@@ -12,7 +12,9 @@ class UploadTexturepacksRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'archive' => ['required', 'file', 'mimetypes:application/zip,application/x-zip,application/octet-stream', 'max:512000'],
+            'archive' => ['nullable', 'file', 'max:4194304'],
+            'files' => ['nullable', 'array', 'max:20'],
+            'files.*' => ['file', 'max:4194304'],
         ];
     }
 
@@ -22,10 +24,18 @@ class UploadTexturepacksRequest extends FormRequest
     public function messages(): array
     {
         return [
-            'archive.required' => 'Choose a .zip file to upload.',
-            'archive.file' => 'Upload must be a single file.',
-            'archive.mimetypes' => 'The upload must be a .zip archive.',
-            'archive.max' => 'The archive may not be larger than 500 MB.',
+            'archive.file' => 'Upload must be a file.',
+            'archive.max' => 'The archive may not be larger than 4 GB.',
+            'files.*.max' => 'Each .pack file may not be larger than 4 GB.',
         ];
+    }
+
+    public function withValidator(\Illuminate\Validation\Validator $validator): void
+    {
+        $validator->after(function ($v) {
+            if (! $this->hasFile('archive') && ! $this->hasFile('files')) {
+                $v->errors()->add('files', 'Choose at least one .zip archive or .pack file(s) to upload.');
+            }
+        });
     }
 }

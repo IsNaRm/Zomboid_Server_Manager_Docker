@@ -1,5 +1,6 @@
 #version 300 es
 precision highp float;
+precision highp int;
 precision highp sampler2DArray;
 
 uniform sampler2DArray uAtlasArray;  // bound to active LOD's array texture
@@ -8,6 +9,7 @@ uniform int uIsSavePass;             // 0 = base, 1 = save-overlay pass
 uniform int uHighlightChanges;       // 0 = normal, 1 = тинт save sprites жёлтым
 
 flat in int vAtlasPage;
+flat in ivec2 vTileSquare;
 in vec2 vUv;
 in float vAlpha;
 

@@ -36,6 +36,14 @@ uniform float uMaxWorldDepth;     // нормализатор для multi-cell 
                                   // = (maxWorldSx + maxWorldSy + buffer).
                                   // Все cells вместе должны попадать в
                                   // [-1..1] NDC.z без конфликтов.
+uniform int   uForceLayer;        // -1 = use decoded layer (compact ground=0).
+                                  // ≥0 = override (save-overlay pass рисует
+                                  // entries per-layer, передаёт N для layer
+                                  // sprites чтобы floor shift применялся).
+uniform int   uIsSavePass;        // 0 = base, 1 = save-overlay. При save=1
+                                  // z получает small negative bias чтобы save
+                                  // sprites выигрывали у base при depthFunc(LEQUAL)
+                                  // на тех же (sx, sy, layer) — pzmap2dzi-style.
 uniform int   uSquareStride;      // decimation factor (= effective stride).
                                   // Entries уже pre-sorted в worker pack:
                                   // CPU pass'ит ровно нужный instanceCount,
@@ -55,6 +63,7 @@ uniform int uSpriteInfoWidth;    // ширина для 2D decode lookup
 
 // Outputs to fragment.
 flat out int vAtlasPage;
+flat out ivec2 vTileSquare; // cell-local (sx, sy) 0..255 для save-mask lookup
 out vec2 vUv;
 out float vAlpha;
 
@@ -86,7 +95,10 @@ void main() {
     uint spriteId = e.r & 0xFFFFu;
     uint sx = (e.r >> 16) & 0xFFu;
     uint sy = (e.r >> 24) & 0xFFu;
-    int  layer  = 0;
+    // Compact ground-only format не содержит layer info. Save-overlay
+    // pass передаёт uForceLayer чтобы upper-floor sprites сдвигались
+    // правильно через uFloorHeightPx умножение ниже.
+    int  layer  = uForceLayer >= 0 ? uForceLayer : 0;
     uint zStack = 0u;
     uint flags  = 0u;
 
@@ -187,6 +199,7 @@ void main() {
         + corner * max(uvSize - pixelSize, vec2(0.0));
     vUv = uvInner;
     vAtlasPage = atlasPage;
+    vTileSquare = ivec2(int(sx), int(sy));
     vAlpha = (flags & 0x40u) != 0u ? 0.5 : 1.0;  // halfWater flag
 
     // 7. Depth для isometric painter's algorithm (multi-cell).
@@ -201,6 +214,8 @@ void main() {
     float worldDepth = (worldSX + worldSY) / uMaxWorldDepth;  // [0..1]
     float stackPunch = float(zStack) * 0.00002;   // ε для внутри-square
     float floorPunch = float(layer) * 0.0005;     // больше чем stack max
+    // Save-overlay рисуется поверх base при равной глубине — небольшое смещение.
+    float savePunch = uIsSavePass == 1 ? 0.00015 : 0.0;
     gl_Position = uViewProj * vec4(cornerPx, 0.0, 1.0);
-    gl_Position.z = (1.0 - 2.0 * worldDepth) - stackPunch - floorPunch;
+    gl_Position.z = (1.0 - 2.0 * worldDepth) - stackPunch - floorPunch - savePunch;
 }

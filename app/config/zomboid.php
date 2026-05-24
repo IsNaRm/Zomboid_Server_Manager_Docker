@@ -51,6 +51,14 @@ return [
     */
     'game_server_path' => env('PZ_SERVER_PATH', '/pz-server'),
 
+    /*
+    | Primary map name used as PZ base map directory. PZ_MAP_NAMES env var
+    | accepts a semicolon-separated list (для модов с замощёнными картами);
+    | мы используем первое имя для base map path: {game_server_path}/media/maps/{primary}.
+    */
+    'map_name_primary' => explode(';', (string) env('PZ_MAP_NAMES', 'Muldraugh, KY'))[0],
+
+
     'map' => [
         'tiles_path' => env('PZ_MAP_TILES_PATH', '/map-tiles'),
         'texturepacks_path' => env('PZ_MAP_TEXTUREPACKS_PATH', '/pz-data/texturepacks'),
@@ -59,7 +67,7 @@ return [
         // DB-настройка MapRenderSetting.atlas_download_url имеет приоритет над env.
         'atlas_download_url' => env(
             'PZ_MAP_ATLAS_DOWNLOAD_URL',
-            'https://github.com/IsNaRm/Zomboid_Server_Manager_Docker/releases/download/atlas-b41/atlases-b41.tar.gz'
+            'https://github.com/IsNaRm/Zomboid_Server_Manager_Docker/releases/download/atlas-b42/atlases-b4218.tar.gz'
         ),
         'tile_size' => 256,
         'min_zoom' => 13,

@@ -22,6 +22,13 @@ const post = self as unknown as {
     postMessage(msg: WorkerMessageOut, transfer?: Transferable[]): void;
 };
 
+/**
+ * Сколько PZ layers парсить из base lotpack.
+ * 0 = ground, 1 = walls/окна, 2 = furniture/objects, 3 = низ 2-го этажа.
+ * Слайдер maxFloor в UI ограничен 0..3 → парсим все.
+ */
+const NUM_LAYERS = 4;
+
 self.onmessage = (ev: MessageEvent<WorkerMessageIn>) => {
     const msg = ev.data;
 
@@ -46,32 +53,52 @@ self.onmessage = (ev: MessageEvent<WorkerMessageIn>) => {
             blockSize: header.blockSize,
             cellSizeInBlocks: header.cellSizeInBlocks,
         });
-        // Keep ТОЛЬКО ground layer (layer=0). VRAM economy 4×: atlas 8192h
-        // вместо 16384h = 512MB вместо 1GB. Upper floors можно включить
-        // через UI toggle (отдельная подгрузка из IDB cache).
-        const { packed, entriesCount, strideOffsets } = packLotpackEntries(
-            lotpack,
-            header.cellSizeInBlocks,
-            header.spriteNames,
-            spriteNameToId,
-            { keepMinLayer: 0, keepMaxLayer: 1 },
-        );
-        const parseTimeMs = performance.now() - t0;
 
-        const buf = packed.buffer as ArrayBuffer;
-        const offsetsBuf = strideOffsets.buffer as ArrayBuffer;
+        // Парсим каждый layer отдельно (даже если PZ-layer не присутствует
+        // в lotpack — получим пустой результат с entriesCount=0).
+        const perLayer: Array<{
+            layer: number;
+            packed: ArrayBuffer;
+            entriesCount: number;
+            strideOffsets: ArrayBuffer;
+        }> = [];
+        const transfer: ArrayBuffer[] = [];
+
+        for (let layer = 0; layer < NUM_LAYERS; layer++) {
+            const result = packLotpackEntries(
+                lotpack,
+                header.cellSizeInBlocks,
+                header.spriteNames,
+                spriteNameToId,
+                { keepMinLayer: layer, keepMaxLayer: layer + 1 },
+            );
+            const packedBuf = result.packed.buffer as ArrayBuffer;
+            const stridesBuf = result.strideOffsets.buffer as ArrayBuffer;
+            perLayer.push({
+                layer,
+                packed: packedBuf,
+                entriesCount: result.entriesCount,
+                strideOffsets: stridesBuf,
+            });
+            transfer.push(packedBuf, stridesBuf);
+        }
+
+        const parseTimeMs = performance.now() - t0;
+        // Legacy single-packed для backward compat (= layer 0).
+        const layer0 = perLayer[0]!;
         post.postMessage(
             {
                 type: 'parse-result',
                 taskId,
                 cellX,
                 cellY,
-                packed: buf,
-                entriesCount,
-                strideOffsets: offsetsBuf,
+                packed: layer0.packed,
+                entriesCount: layer0.entriesCount,
+                strideOffsets: layer0.strideOffsets,
                 parseTimeMs,
+                perLayer,
             },
-            [buf, offsetsBuf],
+            transfer,
         );
     } catch (err) {
         const error = err instanceof Error ? err.message : String(err);

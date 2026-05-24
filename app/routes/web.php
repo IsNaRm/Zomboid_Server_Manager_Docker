@@ -80,12 +80,17 @@ Route::middleware(['auth', 'admin', 'throttle:admin'])->group(function () {
                 Route::get('cell/{x}/{y}/lotpack', [Admin\PzMapDataController::class, 'cellLotpack'])->name('cell.lotpack')->where(['x' => '\d+', 'y' => '\d+']);
                 Route::get('cell/{x}/{y}/save', [Admin\PzMapDataController::class, 'saveCellData'])->name('cell.save')->where(['x' => '\d+', 'y' => '\d+']);
                 Route::get('cells/bulk', [Admin\PzMapDataController::class, 'cellsBulk'])->name('cells.bulk');
+                Route::get('save/noise-prefixes', [Admin\PzSaveFilterController::class, 'show'])->name('save.noise.show');
+                Route::post('save/noise-prefixes', [Admin\PzSaveFilterController::class, 'update'])->name('save.noise.update');
             });
         });
 
         // Map Render schedule + quality (non-destructive)
         Route::put('map/render/schedule', [Admin\MapRenderController::class, 'updateSchedule'])->name('map.render.schedule.update');
         Route::put('map/render/quality', [Admin\MapRenderController::class, 'updateQuality'])->name('map.render.quality.update');
+        Route::get('map/render/atlas-status', [Admin\MapRenderController::class, 'atlasStatus'])->name('map.render.atlas.status');
+        Route::post('map/render/atlas/build', [Admin\MapRenderController::class, 'buildAtlas'])->name('map.render.atlas.build');
+        Route::post('map/render/atlas/build/cancel', [Admin\MapRenderController::class, 'cancelBuildAtlas'])->name('map.render.atlas.build.cancel');
 
         // Config
         Route::get('config', [Admin\ConfigController::class, 'index'])->name('config');

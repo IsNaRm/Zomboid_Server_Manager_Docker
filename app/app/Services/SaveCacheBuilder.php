@@ -19,6 +19,8 @@ class SaveCacheBuilder
 
     public const LAST_RUN_KEY = 'pz:save-cache:last-run';
 
+    public const EXTRA_NOISE_PREFIXES_KEY = 'pz:save-cache:extra-noise-prefixes';
+
     public const LOCK_TTL_SECONDS = 1800;
 
     public function __construct(private readonly string $scriptPath = '/var/www/html/docker/scripts/rebuild_save_cache.py') {}
@@ -48,6 +50,29 @@ class SaveCacheBuilder
     public function setLastRunAt(int $unixTime): void
     {
         Cache::forever(self::LAST_RUN_KEY, $unixTime);
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    public function getExtraNoisePrefixes(): array
+    {
+        $value = Cache::get(self::EXTRA_NOISE_PREFIXES_KEY);
+
+        return is_array($value) ? array_values(array_filter($value, 'is_string')) : [];
+    }
+
+    /**
+     * @param  array<int, string>  $prefixes
+     */
+    public function setExtraNoisePrefixes(array $prefixes): void
+    {
+        $clean = array_values(array_unique(array_filter(array_map(
+            static fn ($p): string => is_string($p) ? trim($p) : '',
+            $prefixes,
+        ), static fn (string $p): bool => $p !== '' && preg_match('/^[a-zA-Z0-9_]+$/', $p) === 1)));
+
+        Cache::forever(self::EXTRA_NOISE_PREFIXES_KEY, $clean);
     }
 
     public function saveDir(): string
@@ -87,14 +112,7 @@ class SaveCacheBuilder
      */
     public function runFullRebuild(?int $workers = null): array
     {
-        return $this->run([
-            '--save-dir' => $this->saveDir(),
-            '--pz-root' => (string) config('zomboid.game_server_path', '/pz-server'),
-            '--output-dir' => $this->outputDir(),
-            '--sprites-json' => $this->spritesJsonPath(),
-            '--server-name' => (string) config('zomboid.server_name', 'ZomboidServer'),
-            '--workers' => (string) max(1, $workers ?? $this->detectCpuCores()),
-        ]);
+        return $this->run($this->buildBaseArgs($workers));
     }
 
     /**
@@ -107,14 +125,35 @@ class SaveCacheBuilder
     public function runIncrementalRebuild(int $since, ?int $workers = null): array
     {
         return $this->run([
+            ...$this->buildBaseArgs($workers),
+            '--since-mtime' => (string) $since,
+        ]);
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function buildBaseArgs(?int $workers): array
+    {
+        $serverPath = rtrim((string) config('zomboid.game_server_path', '/pz-server'), '/');
+        $mapName = (string) config('zomboid.map_name_primary', 'Muldraugh, KY');
+
+        $args = [
             '--save-dir' => $this->saveDir(),
-            '--pz-root' => (string) config('zomboid.game_server_path', '/pz-server'),
+            '--pz-root' => $serverPath,
             '--output-dir' => $this->outputDir(),
             '--sprites-json' => $this->spritesJsonPath(),
             '--server-name' => (string) config('zomboid.server_name', 'ZomboidServer'),
             '--workers' => (string) max(1, $workers ?? $this->detectCpuCores()),
-            '--since-mtime' => (string) $since,
-        ]);
+            '--base-map-path' => $serverPath.'/media/maps/'.$mapName,
+        ];
+
+        $extra = $this->getExtraNoisePrefixes();
+        if ($extra !== []) {
+            $args['--extra-noise-prefixes'] = implode(',', $extra);
+        }
+
+        return $args;
     }
 
     /**

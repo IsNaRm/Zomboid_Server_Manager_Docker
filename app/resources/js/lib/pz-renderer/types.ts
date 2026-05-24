@@ -172,7 +172,7 @@ export interface WorkerParseResponse {
     taskId: number;
     cellX: number;
     cellY: number;
-    /** Packed Uint32Array.buffer (transferred обратно). */
+    /** Layer 0 packed (backward compat). Тот же что perLayer[0].packed. */
     packed: ArrayBuffer;
     entriesCount: number;
     /**
@@ -186,6 +186,16 @@ export interface WorkerParseResponse {
      */
     strideOffsets: ArrayBuffer;
     parseTimeMs: number;
+    /**
+     * Per-layer packed entries для slider'а этажей. layer 0 = ground (= packed
+     * выше), 1+ = upper floors. Renderer upload'ит на GPU по запросу.
+     */
+    perLayer: Array<{
+        layer: number;
+        packed: ArrayBuffer;
+        entriesCount: number;
+        strideOffsets: ArrayBuffer;
+    }>;
 }
 
 export interface WorkerErrorResponse {
