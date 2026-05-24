@@ -40,10 +40,11 @@ WORKDIR /var/www/html
 COPY composer.json composer.lock ./
 RUN composer install --no-dev --no-scripts --no-autoloader --prefer-dist
 
-# Install pzmap2dzi for map tile generation (pyclipper needs C++ compiler)
+# Install pzmap2dzi for map tile generation (pyclipper needs C++ compiler).
+# kaitaistruct нужен для pzdataspec (B42 save .bin parsing в rebuild_save_cache.py).
 RUN apk add --no-cache --virtual .pzmap-build-deps g++ python3-dev \
     && git clone --depth 1 https://github.com/cff29546/pzmap2dzi.git /opt/pzmap2dzi \
-    && pip3 install --break-system-packages lupa pyclipper pillow pyyaml ruamel.yaml requests rectpack \
+    && pip3 install --break-system-packages lupa pyclipper pillow pyyaml ruamel.yaml requests rectpack kaitaistruct \
     && apk del .pzmap-build-deps
 
 # Copy package files and install + build frontend

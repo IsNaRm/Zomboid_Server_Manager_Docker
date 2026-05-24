@@ -129,6 +129,17 @@ if echo "$@" | grep -q "supervisord"; then
     # "Map render engine" panel on /admin/players/map, which dispatches
     # a queued job after explicit confirmation.
 
+    # pzdataspec parser library — fetched once on first boot, kept in the
+    # shared /map-tiles/lib volume. Used by rebuild_save_cache.py to parse
+    # B42 save chunks into packed Uint32Array files for the WebGL renderer.
+    if [ ! -d "/map-tiles/lib/pzdataspec" ] && [ -f /opt/pzmap2dzi/main.py ]; then
+        echo "[entrypoint] Installing pzdataspec parser library..."
+        PZDATASPEC_LIB_PATH=/map-tiles/lib \
+            python3 /var/www/html/docker/scripts/install_pzdataspec.py \
+            >> /var/www/html/storage/logs/pzdataspec-install.log 2>&1 || \
+            echo "[entrypoint] pzdataspec install failed — see logs/pzdataspec-install.log"
+    fi
+
     # Item icons — download in background if catalog exists but icons are missing
     ICON_DIR="/var/www/html/public/images/items"
     CATALOG="${LUA_BRIDGE_DIR}/items_catalog.json"

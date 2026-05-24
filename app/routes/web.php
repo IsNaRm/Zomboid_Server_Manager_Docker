@@ -233,6 +233,8 @@ Route::middleware(['auth', 'admin', 'throttle:admin'])->group(function () {
             Route::post('map/render/resume', [Admin\MapRenderController::class, 'resumeRender'])->name('map.render.resume');
             Route::post('map/render/texturepacks', [Admin\MapRenderController::class, 'uploadTexturepacks'])->name('map.render.texturepacks.upload');
             Route::delete('map/render/texturepacks', [Admin\MapRenderController::class, 'deleteTexturepacks'])->name('map.render.texturepacks.delete');
+            Route::put('map/render/atlas-url', [Admin\MapRenderController::class, 'updateAtlasUrl'])->name('map.render.atlas.url.update');
+            Route::post('map/render/atlas/download', [Admin\MapRenderController::class, 'downloadAtlas'])->name('map.render.atlas.download');
         });
 
         // Destructive actions — very strict rate limit

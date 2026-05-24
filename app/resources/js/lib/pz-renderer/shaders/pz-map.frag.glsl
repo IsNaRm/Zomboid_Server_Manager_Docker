@@ -4,6 +4,8 @@ precision highp sampler2DArray;
 
 uniform sampler2DArray uAtlasArray;  // bound to active LOD's array texture
 uniform int uDebugMode;              // 0 = normal, 1 = solid magenta, 2 = UV viz
+uniform int uIsSavePass;             // 0 = base, 1 = save-overlay pass
+uniform int uHighlightChanges;       // 0 = normal, 1 = тинт save sprites жёлтым
 
 flat in int vAtlasPage;
 in vec2 vUv;
@@ -30,5 +32,10 @@ void main() {
     // partial alpha бывает только если у самого sprite content soft edges.
     // 0.5 threshold убирает оставшиеся artifacts на границах.
     if (c.a < 0.5) discard;
-    fragColor = vec4(c.rgb, c.a * vAlpha);
+    vec3 rgb = c.rgb;
+    if (uIsSavePass == 1 && uHighlightChanges == 1) {
+        // Жёлтый тинт для debug подсветки save-cells.
+        rgb = mix(rgb, vec3(1.0, 0.95, 0.2), 0.55);
+    }
+    fragColor = vec4(rgb, c.a * vAlpha);
 }

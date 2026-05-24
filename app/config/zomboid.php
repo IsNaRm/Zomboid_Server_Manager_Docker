@@ -54,6 +54,13 @@ return [
     'map' => [
         'tiles_path' => env('PZ_MAP_TILES_PATH', '/map-tiles'),
         'texturepacks_path' => env('PZ_MAP_TEXTUREPACKS_PATH', '/pz-data/texturepacks'),
+        // URL для prebuilt atlas tarball (gzip'd tar). Используется командой
+        // zomboid:download-atlas если атласы отсутствуют на чистой инсталляции.
+        // DB-настройка MapRenderSetting.atlas_download_url имеет приоритет над env.
+        'atlas_download_url' => env(
+            'PZ_MAP_ATLAS_DOWNLOAD_URL',
+            'https://github.com/IsNaRm/Zomboid_Server_Manager_Docker/releases/download/atlas-b41/atlases-b41.tar.gz'
+        ),
         'tile_size' => 256,
         'min_zoom' => 13,
         'max_zoom' => 17,

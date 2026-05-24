@@ -28,6 +28,8 @@ import {
 } from './gpu/sprite-info-texture';
 import { AtlasLoader, type LodTexture } from './loaders/atlas-loader';
 import { CellLoader, buildSpriteNameToId, type CellLoaderStats } from './loaders/cell-loader';
+import { SaveCellLoader, type SaveCellLoaderStats } from './loaders/save-cell-loader';
+import { SaveWatcher } from './loaders/save-watcher';
 import { StreamingManager } from './loaders/streaming-manager';
 import { computeRectCover } from './utils/rect-cover';
 import { loadAllManifests, type AllManifests } from './loaders/manifest-loader';
@@ -38,6 +40,7 @@ import type {
     GlCapabilities,
     PzMapRendererOptions,
     RendererState,
+    SaveOverlayMode,
 } from './types';
 
 /**
@@ -101,6 +104,14 @@ export class PzMapRenderer {
     /** Manifest existing cells set — reused в визибилити вычислениях. */
     private existingCellsSet: Set<string> | null = null;
     private cellStats: CellLoaderStats | null = null;
+
+    // === Save-game overlay state ===
+    private saveCellTextureMgr: CellTextureManager | null = null;
+    private saveCellLoader: SaveCellLoader | null = null;
+    private saveWatcher: SaveWatcher | null = null;
+    private saveOverlayMode: SaveOverlayMode = 'overlay';
+    private saveStats: SaveCellLoaderStats | null = null;
+    private saveLastUpdateAt: number | null = null;
 
     private state: RendererState = 'idle';
     private readonly progress: ProgressAggregator;
@@ -166,6 +177,20 @@ export class PzMapRenderer {
     /** Информация про cell texture (для debug HUD). */
     getCellTextureInfo() {
         return this.cellTextureMgr?.getInfo() ?? null;
+    }
+
+    /** Стата save-overlay загрузки (для debug HUD). */
+    getSaveStats(): { stats: SaveCellLoaderStats | null; lastUpdateAt: number | null; mode: SaveOverlayMode } {
+        return {
+            stats: this.saveStats,
+            lastUpdateAt: this.saveLastUpdateAt,
+            mode: this.saveOverlayMode,
+        };
+    }
+
+    /** Переключить режим save-overlay (off / overlay / highlight). */
+    setSaveOverlayMode(mode: SaveOverlayMode): void {
+        this.saveOverlayMode = mode;
     }
 
     /**
@@ -431,6 +456,8 @@ export class PzMapRenderer {
                     'uFloorHeightPx',
                     'uMaxWorldDepth',
                     'uSquareStride',
+                    'uIsSavePass',
+                    'uHighlightChanges',
                 ],
             );
 
@@ -446,6 +473,13 @@ export class PzMapRenderer {
             this.setState('ready');
             this.startRenderLoop();
             this.opts.onReady?.();
+
+            // Запускаем save-overlay асинхронно — не блокирует ready.
+            if (this.opts.enableSaveOverlay !== false) {
+                void this.initSaveOverlay().catch((err) => {
+                    console.warn('[renderer] save-overlay init failed:', err);
+                });
+            }
         } catch (err) {
             if ((err as Error).name === 'AbortError') {
                 this.setState('cancelled');
@@ -610,6 +644,9 @@ export class PzMapRenderer {
         gl.uniformMatrix4fv(u.uViewProj!, false, view);
         gl.uniform1f(u.uSqr!, sqr);
         gl.uniform1f(u.uNativeSqr!, 64);
+        // Save overlay uniforms — base pass всегда с isSavePass=0.
+        gl.uniform1ui(u.uIsSavePass!, 0);
+        gl.uniform1ui(u.uHighlightChanges!, 0);
         gl.uniform1i(u.uIsometric!, isometric ? 1 : 0);
         gl.uniform1i(u.uLod!, lod);
         gl.uniform1i(u.uNLods!, this.manifests.atlas.lods.length);
@@ -808,6 +845,21 @@ export class PzMapRenderer {
             totalInstances += instanceCount;
         }
 
+        // === Save-overlay pass ===
+        // depthFunc(LEQUAL) уже включён выше — save sprites побеждают base
+        // при равной глубине. Same shader, same atlas array texture binding.
+        if (this.saveOverlayMode !== 'off' && this.saveCellTextureMgr) {
+            this.drawSaveOverlayPass(
+                viewLeft,
+                viewRight,
+                viewTop,
+                viewBottom,
+                sqr,
+                isometric,
+                renderK,
+            );
+        }
+
         gl.bindVertexArray(null);
         this.lastDrawnCellsCount = drawn;
         this.lastDrawnInstanceCount = totalInstances;
@@ -946,6 +998,206 @@ export class PzMapRenderer {
         };
     }
 
+    /**
+     * Инициализация save-overlay pipeline. Запускается после base renderer
+     * вошёл в 'ready' — не блокирует первичную загрузку.
+     *
+     * Никакого client-side парсинга: серверный artisan `pz:rebuild-save-cache`
+     * уже выпек packed Uint32Array файлы через Python pzdataspec, nginx раздаёт
+     * их напрямую. Мы просто скачиваем готовые байты и заливаем в GPU.
+     */
+    private async initSaveOverlay(): Promise<void> {
+        if (!this.gl || !this.capabilities || !this.cellTextureMgr) return;
+
+        const baseInfo = this.cellTextureMgr.getInfo();
+        const saveBaseUrl = this.opts.saveBaseUrl ?? '/pz-save-data';
+
+        // Один прямоугольник на весь cell range — save data разрежены,
+        // одного atlas обычно достаточно.
+        const ATLAS_WIDTH = Math.min(2048, this.capabilities.maxTextureSize);
+        const ATLAS_HEIGHT = Math.min(4096, this.capabilities.maxTextureSize);
+        const regionRect: readonly [number, number, number, number] = [
+            baseInfo.originCellX,
+            baseInfo.originCellY,
+            baseInfo.indexGridWidth,
+            baseInfo.indexGridHeight,
+        ];
+
+        this.saveCellTextureMgr = new CellTextureManager({
+            gl: this.gl,
+            atlasWidth: ATLAS_WIDTH,
+            atlasHeight: ATLAS_HEIGHT,
+            indexGridWidth: baseInfo.indexGridWidth,
+            indexGridHeight: baseInfo.indexGridHeight,
+            originCellX: baseInfo.originCellX,
+            originCellY: baseInfo.originCellY,
+            atlasHeights: [ATLAS_HEIGHT],
+            regionRects: [regionRect],
+        });
+
+        this.saveCellLoader = new SaveCellLoader({
+            textureMgr: this.saveCellTextureMgr,
+            saveBaseUrl,
+            signal: this.opts.signal,
+        });
+
+        const initialManifest = await this.saveCellLoader.loadManifest();
+        if (!initialManifest) {
+            console.info('[renderer] save-overlay: no manifest yet (server cache not built)');
+            this.saveStats = this.saveCellLoader.getStats();
+        } else {
+            await this.saveCellLoader.loadCells(initialManifest.cells);
+            this.saveCellTextureMgr.flush();
+            this.saveStats = this.saveCellLoader.getStats();
+            console.info(
+                `[renderer] save-overlay loaded: ${this.saveStats.parsedCells} cells `
+                + `(skipped ${this.saveStats.skippedCells}), `
+                + `save_version=B${this.saveStats.saveVersion ?? '?'}`,
+            );
+        }
+
+        // Запускаем watcher для real-time updates.
+        this.saveWatcher = new SaveWatcher({
+            loader: this.saveCellLoader,
+            onUpdate: (changedCells, lastUpdateAt) => {
+                this.saveLastUpdateAt = lastUpdateAt;
+                if (this.saveCellLoader) {
+                    this.saveStats = this.saveCellLoader.getStats();
+                }
+                console.info(
+                    `[renderer] save-overlay updated: ${changedCells} cells changed`,
+                );
+            },
+        });
+        if (initialManifest) {
+            this.saveWatcher.setInitialManifestVersion(initialManifest.version);
+        }
+        this.saveWatcher.start();
+    }
+
+    /**
+     * Save-overlay pass — рендерит save-cells поверх базы используя тот же
+     * shader program и uniforms, но binding отдельной cell-atlas texture
+     * и устанавливая uIsSavePass=1 (для potential highlight tint).
+     */
+    private drawSaveOverlayPass(
+        viewLeft: number,
+        viewRight: number,
+        viewTop: number,
+        viewBottom: number,
+        sqr: number,
+        isometric: boolean,
+        renderK: number,
+    ): void {
+        if (
+            !this.gl
+            || !this.saveCellTextureMgr
+            || !this.mainProgram
+            || this.saveOverlayMode === 'off'
+        ) {
+            return;
+        }
+        const gl = this.gl;
+        const u = this.mainProgram.uniforms;
+
+        gl.uniform1ui(
+            u.uIsSavePass!,
+            1,
+        );
+        gl.uniform1ui(
+            u.uHighlightChanges!,
+            this.saveOverlayMode === 'highlight' ? 1 : 0,
+        );
+
+        const saveInfo = this.saveCellTextureMgr.getInfo();
+        gl.activeTexture(gl.TEXTURE0);
+        gl.uniform1i(u.uCellAtlas!, 0);
+        gl.uniform1i(u.uCellAtlasWidth!, saveInfo.atlasWidth);
+
+        const cellSizeInSquares = 256;
+        const padding = (700 + 600) * (sqr / 64);
+
+        // Iterate всех save cells. Без super-cell logic (saveOverlay не
+        // использует streaming K — это маленький overlay).
+        const range = this.getCellRange();
+        if (!range) {
+            gl.uniform1ui(u.uIsSavePass!, 0);
+            gl.uniform1ui(u.uHighlightChanges!, 0);
+            return;
+        }
+
+        let boundLayer = -1;
+        let drawnSave = 0;
+        for (let cy = range.minY; cy <= range.maxY; cy++) {
+            for (let cx = range.minX; cx <= range.maxX; cx++) {
+                const info = this.saveCellTextureMgr.getCellInfo(cx, cy);
+                if (!info || info.length === 0) continue;
+
+                const cellOriginSx = cx * cellSizeInSquares;
+                const cellOriginSy = cy * cellSizeInSquares;
+                const cellEndSx = cellOriginSx + cellSizeInSquares;
+                const cellEndSy = cellOriginSy + cellSizeInSquares;
+                let minX: number;
+                let maxX: number;
+                let minY: number;
+                let maxY: number;
+                if (isometric) {
+                    const h2 = sqr * 0.5;
+                    const c1x = (cellOriginSx - cellOriginSy) * sqr;
+                    const c2x = (cellEndSx - cellOriginSy) * sqr;
+                    const c3x = (cellOriginSx - cellEndSy) * sqr;
+                    const c4x = (cellEndSx - cellEndSy) * sqr;
+                    const c1y = (cellOriginSx + cellOriginSy) * h2;
+                    const c2y = (cellEndSx + cellOriginSy) * h2;
+                    const c3y = (cellOriginSx + cellEndSy) * h2;
+                    const c4y = (cellEndSx + cellEndSy) * h2;
+                    minX = Math.min(c1x, c2x, c3x, c4x) - padding;
+                    maxX = Math.max(c1x, c2x, c3x, c4x) + padding;
+                    minY = Math.min(c1y, c2y, c3y, c4y) - padding;
+                    maxY = Math.max(c1y, c2y, c3y, c4y) + padding;
+                } else {
+                    minX = cellOriginSx * sqr - padding;
+                    maxX = cellEndSx * sqr + padding;
+                    minY = cellOriginSy * sqr - padding;
+                    maxY = cellEndSy * sqr + padding;
+                }
+                if (maxX < viewLeft || minX > viewRight) continue;
+                if (maxY < viewTop || minY > viewBottom) continue;
+
+                const rawCount = info.strideOffsets
+                    ? info.strideOffsets[renderK]!
+                    : info.length;
+                const instanceCount = Math.min(rawCount, info.length);
+                if (instanceCount === 0) continue;
+
+                if (info.atlasLayer !== boundLayer) {
+                    const tex = this.saveCellTextureMgr.getAtlasTextureForLayer(
+                        info.atlasLayer,
+                    );
+                    if (tex) {
+                        gl.bindTexture(gl.TEXTURE_2D, tex);
+                        boundLayer = info.atlasLayer;
+                    }
+                }
+                gl.uniform2f(u.uCellOriginSq!, cellOriginSx, cellOriginSy);
+                gl.uniform1ui(u.uCellOffsetInAtlas!, info.offset);
+                gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
+                drawnSave++;
+            }
+        }
+
+        // Сбрасываем uniforms для следующего frame.
+        gl.uniform1ui(u.uIsSavePass!, 0);
+        gl.uniform1ui(u.uHighlightChanges!, 0);
+        this.lastDrawnSaveCells = drawnSave;
+    }
+
+    /** Сколько save-cells было нарисовано в последнем frame. */
+    private lastDrawnSaveCells = 0;
+    getLastDrawnSaveCells(): number {
+        return this.lastDrawnSaveCells;
+    }
+
     private setState(newState: RendererState): void {
         this.state = newState;
         this.progress.setState(newState);
@@ -978,6 +1230,10 @@ export class PzMapRenderer {
                 this.cellTextureMgr.dispose();
                 this.cellTextureMgr = null;
             }
+            if (this.saveCellTextureMgr) {
+                this.saveCellTextureMgr.dispose();
+                this.saveCellTextureMgr = null;
+            }
             if (this.spriteInfoTex) {
                 this.gl.deleteTexture(this.spriteInfoTex.texture);
                 this.spriteInfoTex = null;
@@ -987,6 +1243,13 @@ export class PzMapRenderer {
             this.workerPool.dispose();
             this.workerPool = null;
         }
+        if (this.saveWatcher) {
+            this.saveWatcher.dispose();
+            this.saveWatcher = null;
+        }
+        this.saveCellLoader = null;
+        this.saveStats = null;
+        this.saveLastUpdateAt = null;
         // Phase 6.3: clear references which might hold JS heap (Maps/Sets).
         if (this.streamingMgr) {
             this.streamingMgr.clear();

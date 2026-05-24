@@ -30,7 +30,7 @@ class PzMapDataController extends Controller
 
         return response()->file($path, [
             'Content-Type' => 'application/json',
-            'Cache-Control' => 'public, max-age=300',
+            'Cache-Control' => 'no-cache, must-revalidate',
         ]);
     }
 

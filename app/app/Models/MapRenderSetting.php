@@ -29,6 +29,7 @@ class MapRenderSetting extends Model
         'atlas_has_ktx2',
         'atlas_compression_format',
         'cell_pages_built_at',
+        'atlas_download_url',
     ];
 
     protected function casts(): array
@@ -120,6 +121,22 @@ class MapRenderSetting extends Model
     /**
      * Whether the cron expression matches the given moment.
      */
+    /**
+     * Возвращает URL для скачивания атласов с приоритетом:
+     * DB-настройка → env (config) → null.
+     */
+    public function effectiveAtlasDownloadUrl(): ?string
+    {
+        $dbUrl = $this->atlas_download_url ?? null;
+        if (is_string($dbUrl) && trim($dbUrl) !== '') {
+            return trim($dbUrl);
+        }
+
+        $configUrl = (string) config('zomboid.map.atlas_download_url', '');
+
+        return $configUrl !== '' ? $configUrl : null;
+    }
+
     public function isDueAt(CarbonImmutable $moment): bool
     {
         $expression = $this->effectiveCronExpression();

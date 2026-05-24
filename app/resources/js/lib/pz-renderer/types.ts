@@ -268,6 +268,8 @@ export interface PzMapRendererOptions {
     atlasBaseUrl: string;
     /** Base URL для cell data (`/admin/api/pz-map` или `/pz-cell-data`). */
     cellsBaseUrl: string;
+    /** Base URL для save-game endpoints (default: `${cellsBaseUrl}/save`). */
+    saveBaseUrl?: string;
     /** Опциональный AbortSignal для отмены init. */
     signal?: AbortSignal;
     /** Callback на изменение progress (часто, throttled). */
@@ -276,7 +278,17 @@ export interface PzMapRendererOptions {
     onReady?: () => void;
     /** Callback при фатальной ошибке. */
     onError?: (err: Error) => void;
+    /** Включить ли загрузку save-overlay данных после ready. Default: true. */
+    enableSaveOverlay?: boolean;
 }
+
+/**
+ * Режим отображения save-game overlay:
+ *   - 'off':       только базовая карта
+ *   - 'overlay':   save-cells поверх базы (приоритет depth-equal)
+ *   - 'highlight': save-cells поверх базы + жёлтый тинт (debug)
+ */
+export type SaveOverlayMode = 'off' | 'overlay' | 'highlight';
 
 // ---------------------------------------------------------------------------
 // GL capabilities (определяются при создании контекста)

@@ -10,7 +10,8 @@
  * Phase 4+ добавит Leaflet интеграцию для полного map view.
  */
 
-import { BarChart3, Settings } from 'lucide-react';
+import { BarChart3, Layers, Settings } from 'lucide-react';
+import type { SaveOverlayMode } from '@/lib/pz-renderer/types';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { PzMapError } from './pz-map-error';
@@ -74,6 +75,7 @@ export function PzMapView({
     const { t } = useTranslation();
     const [showControls, setShowControls] = useState(false);
     const [showStats, setShowStats] = useState(false);
+    const [saveOverlayMode, setSaveOverlayMode] = useState<SaveOverlayMode>('overlay');
     const { renderer, progress, error, isReady, cancel } = useMapRenderer({
         canvasRef,
         atlasBaseUrl,
@@ -359,6 +361,29 @@ export function PzMapView({
                             }`}
                         >
                             <BarChart3 className="h-4 w-4" />
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                const next: SaveOverlayMode
+                                    = saveOverlayMode === 'off'
+                                        ? 'overlay'
+                                        : saveOverlayMode === 'overlay'
+                                            ? 'highlight'
+                                            : 'off';
+                                setSaveOverlayMode(next);
+                                renderer?.setSaveOverlayMode(next);
+                            }}
+                            title={`Save overlay: ${saveOverlayMode}`}
+                            className={`rounded border p-2 transition ${
+                                saveOverlayMode === 'off'
+                                    ? 'border-zinc-700 bg-zinc-900/80 text-zinc-500 hover:bg-zinc-800'
+                                    : saveOverlayMode === 'overlay'
+                                        ? 'border-purple-600 bg-purple-700/30 text-purple-300'
+                                        : 'border-amber-500 bg-amber-700/30 text-amber-200'
+                            }`}
+                        >
+                            <Layers className="h-4 w-4" />
                         </button>
                     </div>
                     {showControls && (
@@ -710,6 +735,8 @@ function CellStatsHud({ renderer }: { renderer: PzMapRenderer | null }) {
     const [drawnInstances, setDrawnInstances] = useState(0);
     const [renderK, setRenderK] = useState(0);
     const [fps, setFps] = useState(0);
+    const [saveSnapshot, setSaveSnapshot] = useState<ReturnType<PzMapRenderer['getSaveStats']> | null>(null);
+    const [drawnSaveCells, setDrawnSaveCells] = useState(0);
     useEffect(() => {
         if (!renderer) return;
         // FPS counter через rAF: накапливаем frames за 0.5s.
@@ -731,7 +758,9 @@ function CellStatsHud({ renderer }: { renderer: PzMapRenderer | null }) {
             setDrawnCells(renderer.getLastDrawnCellsCount());
             setDrawnInstances(renderer.getLastDrawnInstanceCount());
             setRenderK(renderer.getLastRenderK());
-        }, 250);
+            setSaveSnapshot(renderer.getSaveStats());
+            setDrawnSaveCells(renderer.getLastDrawnSaveCells());
+        }, 500);
         return () => {
             cancelAnimationFrame(raf);
             clearInterval(id);
@@ -800,6 +829,41 @@ function CellStatsHud({ renderer }: { renderer: PzMapRenderer | null }) {
                     {texInfo.indexGridWidth} × {texInfo.indexGridHeight}
                 </span>
             </div>
+            {saveSnapshot && (
+                <>
+                    <p className="mt-2 text-[10px] uppercase tracking-wider text-purple-400">
+                        Save overlay
+                    </p>
+                    <div className="flex justify-between">
+                        <span>Mode</span>
+                        <span className="text-purple-300">{saveSnapshot.mode}</span>
+                    </div>
+                    <div className="flex justify-between">
+                        <span>Save cells</span>
+                        <span>
+                            {saveSnapshot.stats?.parsedCells ?? 0}
+                            {' / drawn '}
+                            {drawnSaveCells}
+                        </span>
+                    </div>
+                    <div className="flex justify-between">
+                        <span>Skipped</span>
+                        <span>{saveSnapshot.stats?.skippedCells ?? 0}</span>
+                    </div>
+                    <div className="flex justify-between">
+                        <span>PZ version</span>
+                        <span>B{saveSnapshot.stats?.saveVersion ?? '?'}</span>
+                    </div>
+                    <div className="flex justify-between text-zinc-500">
+                        <span>Last update</span>
+                        <span>
+                            {saveSnapshot.lastUpdateAt
+                                ? `${Math.round((Date.now() - saveSnapshot.lastUpdateAt) / 1000)}s ago`
+                                : '—'}
+                        </span>
+                    </div>
+                </>
+            )}
         </div>
     );
 }

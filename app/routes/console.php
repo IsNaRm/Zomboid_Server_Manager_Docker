@@ -2,6 +2,7 @@
 
 use App\Enums\BackupType;
 use App\Jobs\CreateBackupJob;
+use App\Jobs\RebuildSaveCacheJob;
 use Illuminate\Support\Facades\Schedule;
 
 Schedule::job(new CreateBackupJob(BackupType::Scheduled))
@@ -42,6 +43,15 @@ Schedule::command('zomboid:process-shop-deliveries')->everyMinute();
 Schedule::command('zomboid:process-money-deposits')->everyMinute();
 
 Schedule::command('zomboid:auto-render-map')->everyMinute()->runInBackground();
+
+/*
+ * Rebuild save-overlay packed Uint32Array files каждые 30 секунд.
+ * First run после старта — full rebuild (~50-100 сек на 65k chunks).
+ * Дальше — incremental (только cells затронутые новыми chunks), sub-second.
+ */
+Schedule::job(new RebuildSaveCacheJob)
+    ->everyThirtySeconds()
+    ->withoutOverlapping();
 
 // Bump manifest.json version when save-game .bin files change so the browser
 // poller (useAtlasVersionPoll) can invalidate its save-data cache automatically.

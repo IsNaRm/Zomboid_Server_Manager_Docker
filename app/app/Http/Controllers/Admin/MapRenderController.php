@@ -236,6 +236,71 @@ class MapRenderController extends Controller
         ]);
     }
 
+    /**
+     * Сохраняет custom URL для скачивания atlas tarball в MapRenderSetting.
+     * Пустая строка / null сбрасывает override → используется env/config.
+     */
+    public function updateAtlasUrl(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'atlas_download_url' => ['nullable', 'string', 'max:500', 'url:http,https'],
+        ]);
+
+        $setting = MapRenderSetting::instance();
+        $setting->atlas_download_url = $validated['atlas_download_url'] ?? null;
+        $setting->save();
+
+        $this->auditLogger->log(
+            actor: $request->user()->name ?? 'admin',
+            action: 'map.atlas.url_updated',
+            details: ['atlas_download_url' => $setting->atlas_download_url],
+            ip: $request->ip(),
+        );
+
+        return response()->json([
+            'message' => 'Atlas download URL updated',
+            'effective_url' => $setting->effectiveAtlasDownloadUrl(),
+        ]);
+    }
+
+    /**
+     * Запускает фоновое скачивание atlas tarball через artisan-команду.
+     * Сам HTTP-запрос возвращается сразу, скачивание идёт в `nohup`.
+     */
+    public function downloadAtlas(Request $request): JsonResponse
+    {
+        $force = (bool) $request->boolean('force');
+        $setting = MapRenderSetting::instance();
+        $url = $setting->effectiveAtlasDownloadUrl();
+
+        if ($url === null) {
+            return response()->json([
+                'message' => 'Atlas download URL не задан. Установите его в настройках или через PZ_MAP_ATLAS_DOWNLOAD_URL env.',
+            ], 422);
+        }
+
+        // Запускаем команду в фоне, ответ не блокируется на 700 MB скачивании.
+        $cmd = sprintf(
+            '(php %s zomboid:download-atlas %s > %s 2>&1 &)',
+            escapeshellarg(base_path('artisan')),
+            $force ? '--force' : '',
+            escapeshellarg(storage_path('logs/atlas-download.log')),
+        );
+        @shell_exec($cmd);
+
+        $this->auditLogger->log(
+            actor: $request->user()->name ?? 'admin',
+            action: 'map.atlas.download_started',
+            details: ['url' => $url, 'force' => $force],
+            ip: $request->ip(),
+        );
+
+        return response()->json([
+            'message' => 'Atlas download started in background. Watch storage/logs/atlas-download.log',
+            'url' => $url,
+        ]);
+    }
+
     public function deleteTexturepacks(Request $request): JsonResponse
     {
         if ($this->renderer->isRendering()) {
