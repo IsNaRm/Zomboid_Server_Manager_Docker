@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Services\GameTimeService;
 use App\Services\PlayerStatsService;
 use Inertia\Inertia;
 use Inertia\Response;
@@ -10,12 +11,14 @@ class RankingsController extends Controller
 {
     public function __construct(
         private readonly PlayerStatsService $playerStatsService,
+        private readonly GameTimeService $gameTime,
     ) {}
 
     public function __invoke(): Response
     {
         return Inertia::render('rankings', [
             'server_stats' => $this->playerStatsService->getServerStats(),
+            'day_length_minutes' => $this->gameTime->realMinutesPerInGameDay(),
             'leaderboard_kills' => Inertia::defer(fn () => $this->playerStatsService->getFullLeaderboard('zombie_kills', 25)),
             'leaderboard_survival' => Inertia::defer(fn () => $this->playerStatsService->getFullLeaderboard('hours_survived', 25)),
             'leaderboard_deaths' => Inertia::defer(fn () => $this->playerStatsService->getDeathLeaderboard(25)),

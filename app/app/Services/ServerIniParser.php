@@ -119,7 +119,7 @@ class ServerIniParser
             throw new \RuntimeException("Failed to write temp file in: {$dir}");
         }
 
-        @chmod($temp, 0o666);
+        @chmod($temp, 0o664);
 
         if (! @rename($temp, $path)) {
             @unlink($temp);

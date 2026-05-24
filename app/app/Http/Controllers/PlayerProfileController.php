@@ -2,8 +2,9 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\GameEvent;
 use App\Enums\UserRole;
+use App\Models\GameEvent;
+use App\Services\GameTimeService;
 use App\Services\PlayerStatsService;
 use Inertia\Inertia;
 use Inertia\Response;
@@ -13,6 +14,7 @@ class PlayerProfileController extends Controller
 {
     public function __construct(
         private readonly PlayerStatsService $playerStatsService,
+        private readonly GameTimeService $gameTime,
     ) {}
 
     public function __invoke(string $username): Response
@@ -28,6 +30,7 @@ class PlayerProfileController extends Controller
         $props = [
             'player' => $profile,
             'is_admin' => $isAdmin,
+            'day_length_minutes' => $this->gameTime->realMinutesPerInGameDay(),
         ];
 
         if ($isAdmin) {

@@ -201,6 +201,7 @@ export type WalletLeaderboardEntry = {
 
 export type RankingsPageData = {
     server_stats: ServerStats;
+    day_length_minutes: number;
     leaderboard_kills: LeaderboardEntry[];
     leaderboard_survival: LeaderboardEntry[];
     leaderboard_deaths: DeathLeaderboardEntry[];
@@ -216,6 +217,7 @@ export type PlayerProfilePageData = {
     player: PlayerProfile;
     recent_events: GameEventEntry[];
     is_admin: boolean;
+    day_length_minutes: number;
 };
 
 export type HeroContent = {

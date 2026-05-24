@@ -137,10 +137,13 @@ prompt PZ_MAX_PLAYERS "Max players" "16"
 prompt PZ_MAX_RAM "Max RAM" "4096m"
 
 echo "  Steam branch:"
+echo -e "  ${DIM}Note: the ZomboidManager mod (player map, inventory, delivery queue,${NC}"
+echo -e "  ${DIM}live stats) only works on Build 42. Picking 'public' or any non-42${NC}"
+echo -e "  ${DIM}branch will leave those dashboard features non-functional.${NC}"
 while true; do
-    echo "    1) public   — Stable release (recommended)"
-    echo "    2) unstable — Latest unstable/experimental"
-    echo "    3) Custom   — Enter a branch name manually"
+    echo "    1) unstable — Build 42 multiplayer (recommended, required for ZomboidManager mod)"
+    echo "    2) public   — Build 41.78.x (legacy stable, mod will NOT work)"
+    echo "    3) Custom   — Enter a branch name manually (mod may NOT work)"
     echo -ne "  ${DIM}[1]${NC}: "
     read -r branch_choice || true
     branch_choice="${branch_choice:-1}"
@@ -148,12 +151,12 @@ while true; do
     echo -e "  ${RED}Invalid choice. Enter 1, 2, or 3.${NC}"
 done
 case "$branch_choice" in
-    1) PZ_STEAM_BRANCH="public" ;;
-    2) PZ_STEAM_BRANCH="unstable" ;;
+    1) PZ_STEAM_BRANCH="unstable" ;;
+    2) PZ_STEAM_BRANCH="public" ;;
     3)
         echo -ne "  Branch name: "
         read -r PZ_STEAM_BRANCH || true
-        PZ_STEAM_BRANCH="${PZ_STEAM_BRANCH:-public}"
+        PZ_STEAM_BRANCH="${PZ_STEAM_BRANCH:-unstable}"
         ;;
 esac
 
@@ -678,8 +681,10 @@ echo "Persisting Steam branch (${PZ_STEAM_BRANCH}) to game-server volume..."
 # CRLF when this is later cross-edited from Windows, etc.).
 TMP_BRANCH_FILE=$(mktemp)
 printf '%s' "$PZ_STEAM_BRANCH" > "$TMP_BRANCH_FILE"
+chmod 0644 "$TMP_BRANCH_FILE"
 docker exec pz-game-server sh -c "mkdir -p /home/steam/Zomboid" >/dev/null 2>&1 || true
 docker cp "$TMP_BRANCH_FILE" pz-game-server:/home/steam/Zomboid/.steam_branch >/dev/null 2>&1 || true
+docker exec pz-game-server sh -c "chmod 0644 /home/steam/Zomboid/.steam_branch" >/dev/null 2>&1 || true
 rm -f "$TMP_BRANCH_FILE"
 
 if [ "$PZ_STEAM_BRANCH" != "public" ]; then

@@ -1,13 +1,14 @@
 import { Deferred, Head, Link } from '@inertiajs/react';
 import { Clock, Coins, Crosshair, Medal, ShoppingCart, Skull, Swords, Trophy, Users } from 'lucide-react';
 import { motion } from 'motion/react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { AnimatedCounter } from '@/components/animated-counter';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useTranslation } from '@/hooks/use-translation';
 import PublicLayout from '@/layouts/public-layout';
+import { convertHours, formatHours, type HoursMode, loadHoursMode, saveHoursMode } from '@/lib/hours-format';
 import type { DeathLeaderboardEntry, LeaderboardEntry, RankingsPageData, RatioLeaderboardEntry, WalletLeaderboardEntry } from '@/types';
 
 type TabKey = 'kills' | 'survival' | 'deaths' | 'kd' | 'hd' | 'pvpd' | 'spent' | 'balance';
@@ -76,7 +77,7 @@ function KillsTable({ data }: { data: LeaderboardEntry[] }) {
     );
 }
 
-function SurvivalTable({ data }: { data: LeaderboardEntry[] }) {
+function SurvivalTable({ data, hoursMode, dayLengthMinutes }: { data: LeaderboardEntry[]; hoursMode: HoursMode; dayLengthMinutes: number }) {
     const { t } = useTranslation();
     if (data.length === 0) {
         return <p className="py-8 text-center text-sm text-muted-foreground">{t('rankings.no_stats')}</p>;
@@ -104,7 +105,7 @@ function SurvivalTable({ data }: { data: LeaderboardEntry[] }) {
                             {entry.is_dead && <Skull className="size-3.5 text-red-500" title="Dead" />}
                         </div>
                         <span className="font-semibold tabular-nums">
-                            {entry.hours_survived.toLocaleString(undefined, { maximumFractionDigits: 1 })}h
+                            {formatHours(entry.hours_survived, hoursMode, dayLengthMinutes)}
                         </span>
                     </Link>
                 </motion.div>
@@ -144,7 +145,19 @@ function DeathsTable({ data }: { data: DeathLeaderboardEntry[] }) {
     );
 }
 
-function RatioTable({ data, unit }: { data: RatioLeaderboardEntry[]; unit?: string }) {
+function RatioTable({
+    data,
+    unit,
+    isHoursRatio,
+    hoursMode,
+    dayLengthMinutes,
+}: {
+    data: RatioLeaderboardEntry[];
+    unit?: string;
+    isHoursRatio?: boolean;
+    hoursMode?: HoursMode;
+    dayLengthMinutes?: number;
+}) {
     const { t } = useTranslation();
     if (data.length === 0) {
         return <p className="py-8 text-center text-sm text-muted-foreground">{t('rankings.no_ratio_data')}</p>;
@@ -152,30 +165,38 @@ function RatioTable({ data, unit }: { data: RatioLeaderboardEntry[]; unit?: stri
 
     return (
         <div className="space-y-1">
-            {data.map((entry, i) => (
-                <motion.div
-                    key={entry.username}
-                    initial={{ opacity: 0, x: -10 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    transition={{ duration: 0.3, delay: i * 0.03 }}
-                >
-                    <Link
-                        href={`/rankings/${entry.username}`}
-                        className="flex items-center justify-between rounded-md px-3 py-2 text-sm transition-colors hover:bg-muted/50"
+            {data.map((entry, i) => {
+                const numerator = isHoursRatio && hoursMode && dayLengthMinutes
+                    ? convertHours(entry.numerator, hoursMode, dayLengthMinutes)
+                    : entry.numerator;
+                const ratio = isHoursRatio && hoursMode && dayLengthMinutes
+                    ? convertHours(entry.ratio, hoursMode, dayLengthMinutes)
+                    : entry.ratio;
+                return (
+                    <motion.div
+                        key={entry.username}
+                        initial={{ opacity: 0, x: -10 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        transition={{ duration: 0.3, delay: i * 0.03 }}
                     >
-                        <div className="flex items-center gap-3">
-                            <RankBadge rank={entry.rank} />
-                            <span className="font-medium">{entry.username}</span>
-                        </div>
-                        <div className="flex items-center gap-2">
-                            <span className="text-xs text-muted-foreground">
-                                ({entry.numerator.toLocaleString(undefined, { maximumFractionDigits: 1 })}{unit ?? ''} / {entry.death_count}d)
-                            </span>
-                            <span className="font-semibold tabular-nums">{entry.ratio.toFixed(2)}</span>
-                        </div>
-                    </Link>
-                </motion.div>
-            ))}
+                        <Link
+                            href={`/rankings/${entry.username}`}
+                            className="flex items-center justify-between rounded-md px-3 py-2 text-sm transition-colors hover:bg-muted/50"
+                        >
+                            <div className="flex items-center gap-3">
+                                <RankBadge rank={entry.rank} />
+                                <span className="font-medium">{entry.username}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <span className="text-xs text-muted-foreground">
+                                    ({numerator.toLocaleString(undefined, { maximumFractionDigits: 1 })}{unit ?? ''} / {entry.death_count}d)
+                                </span>
+                                <span className="font-semibold tabular-nums">{ratio.toFixed(2)}</span>
+                            </div>
+                        </Link>
+                    </motion.div>
+                );
+            })}
         </div>
     );
 }
@@ -242,6 +263,7 @@ const tabs: { key: TabKey; labelKey: string; icon: typeof Skull }[] = [
 
 export default function Rankings({
     server_stats,
+    day_length_minutes,
     leaderboard_kills,
     leaderboard_survival,
     leaderboard_deaths,
@@ -252,14 +274,57 @@ export default function Rankings({
     leaderboard_balance,
 }: RankingsPageData) {
     const [activeTab, setActiveTab] = useState<TabKey>('kills');
+    const [hoursMode, setHoursMode] = useState<HoursMode>('ingame');
     const { t } = useTranslation();
+
+    useEffect(() => {
+        setHoursMode(loadHoursMode());
+    }, []);
+
+    const changeHoursMode = (mode: HoursMode) => {
+        setHoursMode(mode);
+        saveHoursMode(mode);
+    };
+
+    const displayedHours = convertHours(server_stats.total_hours_survived, hoursMode, day_length_minutes);
 
     return (
         <>
             <Head title={t('rankings.title')} />
             <PublicLayout>
                 <main className="mx-auto max-w-7xl px-4 py-8">
-                    <h1 className="mb-6 text-3xl font-bold tracking-tight">{t('rankings.title')}</h1>
+                    <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+                        <h1 className="text-3xl font-bold tracking-tight">{t('rankings.title')}</h1>
+                        <div className="flex items-center gap-2">
+                            <span className="text-xs text-muted-foreground">{t('rankings.time_unit_label')}</span>
+                            <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
+                                <button
+                                    type="button"
+                                    onClick={() => changeHoursMode('ingame')}
+                                    className={`px-3 py-1.5 transition-colors ${
+                                        hoursMode === 'ingame'
+                                            ? 'bg-primary text-primary-foreground'
+                                            : 'text-muted-foreground hover:text-foreground'
+                                    }`}
+                                    title={t('rankings.hours_ingame_tooltip')}
+                                >
+                                    {t('rankings.hours_ingame_short')}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => changeHoursMode('real')}
+                                    className={`px-3 py-1.5 transition-colors ${
+                                        hoursMode === 'real'
+                                            ? 'bg-primary text-primary-foreground'
+                                            : 'text-muted-foreground hover:text-foreground'
+                                    }`}
+                                    title={t('rankings.hours_real_tooltip')}
+                                >
+                                    {t('rankings.hours_real_short')}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
 
                     {/* Server Stats Hero */}
                     <div className="mb-6 grid gap-3 sm:grid-cols-3 lg:grid-cols-5">
@@ -297,7 +362,7 @@ export default function Rankings({
                                 <div>
                                     <p className="text-xs text-muted-foreground">{t('rankings.hours_played')}</p>
                                     <p className="text-2xl font-bold tabular-nums">
-                                        <AnimatedCounter value={server_stats.total_hours_survived} decimals={1} suffix="h" />
+                                        <AnimatedCounter value={displayedHours} decimals={1} suffix="h" />
                                     </p>
                                 </div>
                             </CardContent>
@@ -364,7 +429,7 @@ export default function Rankings({
                             )}
                             {activeTab === 'survival' && (
                                 <Deferred data="leaderboard_survival" fallback={<LeaderboardSkeleton />}>
-                                    <SurvivalTable data={leaderboard_survival ?? []} />
+                                    <SurvivalTable data={leaderboard_survival ?? []} hoursMode={hoursMode} dayLengthMinutes={day_length_minutes} />
                                 </Deferred>
                             )}
                             {activeTab === 'deaths' && (
@@ -379,7 +444,7 @@ export default function Rankings({
                             )}
                             {activeTab === 'hd' && (
                                 <Deferred data="leaderboard_hd" fallback={<LeaderboardSkeleton />}>
-                                    <RatioTable data={leaderboard_hd ?? []} unit="h" />
+                                    <RatioTable data={leaderboard_hd ?? []} unit="h" isHoursRatio hoursMode={hoursMode} dayLengthMinutes={day_length_minutes} />
                                 </Deferred>
                             )}
                             {activeTab === 'pvpd' && (

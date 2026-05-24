@@ -1,11 +1,14 @@
 import { Deferred, Head, Link } from '@inertiajs/react';
 import { Clock, Hammer, LogIn, Medal, Shield, Skull, Swords, Trophy } from 'lucide-react';
 import { motion } from 'motion/react';
+import { useEffect, useState } from 'react';
 import { ActivityFeed } from '@/components/activity-feed';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
+import { useTranslation } from '@/hooks/use-translation';
 import PublicLayout from '@/layouts/public-layout';
+import { formatHours, type HoursMode, loadHoursMode, saveHoursMode } from '@/lib/hours-format';
 import type { PlayerProfilePageData } from '@/types';
 
 const SKILL_CATEGORIES: Record<string, string[]> = {
@@ -35,8 +38,19 @@ function SkillBar({ name, level }: { name: string; level: number }) {
     );
 }
 
-export default function PlayerProfile({ player, recent_events, is_admin }: PlayerProfilePageData) {
-    // Group skills by category
+export default function PlayerProfile({ player, recent_events, is_admin, day_length_minutes }: PlayerProfilePageData) {
+    const { t } = useTranslation();
+    const [hoursMode, setHoursMode] = useState<HoursMode>('ingame');
+
+    useEffect(() => {
+        setHoursMode(loadHoursMode());
+    }, []);
+
+    const changeHoursMode = (mode: HoursMode) => {
+        setHoursMode(mode);
+        saveHoursMode(mode);
+    };
+
     const skills = player.skills ?? {};
     const categorizedSkills: { category: string; skills: { name: string; level: number }[] }[] = [];
     const assignedSkills = new Set<string>();
@@ -66,13 +80,42 @@ export default function PlayerProfile({ player, recent_events, is_admin }: Playe
             <Head title={`${player.username} — Player Profile`} />
             <PublicLayout>
                 <main className="mx-auto max-w-7xl px-4 py-8">
-                    <div className="mb-4">
+                    <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
                         <Link
                             href="/rankings"
                             className="text-sm text-muted-foreground hover:text-foreground"
                         >
                             &larr; Back to Rankings
                         </Link>
+                        <div className="flex items-center gap-2">
+                            <span className="text-xs text-muted-foreground">{t('rankings.time_unit_label')}</span>
+                            <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
+                                <button
+                                    type="button"
+                                    onClick={() => changeHoursMode('ingame')}
+                                    className={`px-3 py-1.5 transition-colors ${
+                                        hoursMode === 'ingame'
+                                            ? 'bg-primary text-primary-foreground'
+                                            : 'text-muted-foreground hover:text-foreground'
+                                    }`}
+                                    title={t('rankings.hours_ingame_tooltip')}
+                                >
+                                    {t('rankings.hours_ingame_short')}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => changeHoursMode('real')}
+                                    className={`px-3 py-1.5 transition-colors ${
+                                        hoursMode === 'real'
+                                            ? 'bg-primary text-primary-foreground'
+                                            : 'text-muted-foreground hover:text-foreground'
+                                    }`}
+                                    title={t('rankings.hours_real_tooltip')}
+                                >
+                                    {t('rankings.hours_real_short')}
+                                </button>
+                            </div>
+                        </div>
                     </div>
 
                     <div className="flex flex-col gap-6">
@@ -122,7 +165,7 @@ export default function PlayerProfile({ player, recent_events, is_admin }: Playe
                                     <div>
                                         <p className="text-xs text-muted-foreground">Hours Survived</p>
                                         <p className="text-2xl font-bold tabular-nums">
-                                            {player.hours_survived.toLocaleString(undefined, { maximumFractionDigits: 1 })}h
+                                            {formatHours(player.hours_survived, hoursMode, day_length_minutes)}
                                         </p>
                                         {player.ranks.survival > 0 && (
                                             <p className="flex items-center gap-1 text-xs text-muted-foreground">
