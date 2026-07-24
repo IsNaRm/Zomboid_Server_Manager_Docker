@@ -67,6 +67,7 @@ Route::middleware(['auth', 'admin', 'throttle:admin'])->group(function () {
         Route::get('mods', [Admin\ModController::class, 'index'])->name('mods');
         Route::post('mods/lookup', [Admin\ModController::class, 'lookup'])->name('mods.lookup');
         Route::post('mods', [Admin\ModController::class, 'store'])->name('mods.store');
+        Route::post('mods/import', [Admin\ModController::class, 'import'])->name('mods.import');
         Route::delete('mods/{workshopId}', [Admin\ModController::class, 'destroy'])->name('mods.destroy');
         Route::put('mods/order', [Admin\ModController::class, 'reorder'])->name('mods.reorder');
 

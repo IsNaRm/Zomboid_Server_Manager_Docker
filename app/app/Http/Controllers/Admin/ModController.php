@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
+use App\Http\Requests\Admin\ImportModsRequest;
 use App\Http\Requests\Admin\LookupWorkshopModRequest;
 use App\Services\AuditLogger;
 use App\Services\DockerManager;
@@ -96,7 +97,7 @@ class ModController extends Controller
             Log::error('Failed to add mod', ['exception' => $e, 'mod' => $validated]);
 
             return response()->json([
-                'error' => 'Could not save mod to server config.',
+                'error' => 'Could not write the server config. The server may still be starting, or the config volume is not writable.',
             ], 500);
         }
 
@@ -131,7 +132,7 @@ class ModController extends Controller
             Log::error('Failed to remove mod', ['exception' => $e, 'workshop_id' => $workshopId]);
 
             return response()->json([
-                'error' => 'Could not save mod removal to server config.',
+                'error' => 'Could not write the server config. The server may still be starting, or the config volume is not writable.',
             ], 500);
         }
 
@@ -170,7 +171,7 @@ class ModController extends Controller
             Log::error('Failed to reorder mods', ['exception' => $e]);
 
             return response()->json([
-                'error' => 'Could not save mod order to server config.',
+                'error' => 'Could not write the server config. The server may still be starting, or the config volume is not writable.',
             ], 500);
         }
 
@@ -192,5 +193,64 @@ class ModController extends Controller
             'pending_restart' => $status['pending_restart'],
             'restart_required' => true,
         ]);
+    }
+
+    /**
+     * Merge a pasted modpack (Workshop/Mods pairs + optional map folders) into the
+     * current list in one write. The result lands in `.mod_state` so it survives
+     * container restarts; map folders are persisted to `.config_state` too.
+     */
+    public function import(ImportModsRequest $request): JsonResponse
+    {
+        $mods = $request->validated('mods');
+        $mapFolders = $request->validated('map', []);
+
+        foreach ($mods as $mod) {
+            if (! empty($mod['map_folder'])) {
+                $mapFolders[] = $mod['map_folder'];
+            }
+        }
+
+        try {
+            $summary = $this->modManager->bulkImport(
+                config('zomboid.paths.server_ini'),
+                $mods,
+                $mapFolders,
+            );
+        } catch (RuntimeException $e) {
+            Log::error('Failed to bulk import mods', ['exception' => $e]);
+
+            return response()->json([
+                'error' => 'Could not write the server config. The server may still be starting, or the config volume is not writable.',
+            ], 500);
+        }
+
+        $this->auditLogger->log(
+            actor: $request->user()->name ?? 'admin',
+            action: 'mod.import',
+            target: 'server.ini',
+            details: $summary,
+            ip: $request->ip(),
+        );
+
+        $serverRunning = false;
+
+        try {
+            $serverRunning = (bool) ($this->dockerManager->getContainerStatus()['running'] ?? false);
+        } catch (\Throwable) {
+            // Docker socket unreachable — report the list without live status
+        }
+
+        $status = $this->modManager->listWithStatus(
+            config('zomboid.paths.server_ini'),
+            $serverRunning,
+        );
+
+        return response()->json([
+            'mods' => $status['mods'],
+            'pending_restart' => $status['pending_restart'],
+            'summary' => $summary,
+            'restart_required' => true,
+        ], 201);
     }
 }

@@ -14,6 +14,7 @@ use App\Services\SandboxLuaParser;
 use App\Services\ServerIniParser;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 use Inertia\Inertia;
 use Inertia\Response;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
@@ -63,8 +64,22 @@ class ConfigController extends Controller
         $path = config('zomboid.paths.server_ini');
         $before = $this->iniParser->read($path);
 
-        $this->iniParser->write($path, $settings);
-        $this->configState->persistSettings($settings, $path);
+        if ($before === []) {
+            return response()->json([
+                'error' => 'Server config not found. Start the game server once so it generates its config, then try again.',
+            ], 409);
+        }
+
+        try {
+            $this->iniParser->write($path, $settings);
+            $this->configState->persistSettings($settings, $path);
+        } catch (\RuntimeException $e) {
+            Log::error('Failed to save server config', ['exception' => $e]);
+
+            return response()->json([
+                'error' => 'Could not write the server config. The config volume may not be writable by the app container.',
+            ], 500);
+        }
 
         $after = $this->iniParser->read($path);
 
@@ -96,7 +111,21 @@ class ConfigController extends Controller
         $path = config('zomboid.paths.sandbox_lua');
         $before = $this->luaParser->read($path);
 
-        $this->luaParser->write($path, $settings);
+        if ($before === []) {
+            return response()->json([
+                'error' => 'Sandbox config not found. Start the game server once so it generates its config, then try again.',
+            ], 409);
+        }
+
+        try {
+            $this->luaParser->write($path, $settings);
+        } catch (\RuntimeException $e) {
+            Log::error('Failed to save sandbox config', ['exception' => $e]);
+
+            return response()->json([
+                'error' => 'Could not write the sandbox config. The config volume may not be writable by the app container.',
+            ], 500);
+        }
 
         $after = $this->luaParser->read($path);
 

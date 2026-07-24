@@ -346,6 +346,26 @@ it('can update sandbox config', function () {
     $response->assertJson(['restart_required' => true]);
 });
 
+it('returns a clear 409 instead of a 500 when the server config is missing', function () {
+    mockAdminIniParser([]); // read() returns [] — server never generated its config
+    mockAdminLuaParser();
+
+    $this->actingAs(adminUser())
+        ->patchJson('/admin/config/server', ['settings' => ['MaxPlayers' => '32']])
+        ->assertStatus(409)
+        ->assertJsonStructure(['error']);
+});
+
+it('returns a clear 409 instead of a 500 when the sandbox config is missing', function () {
+    mockAdminIniParser();
+    mockAdminLuaParser([]);
+
+    $this->actingAs(adminUser())
+        ->patchJson('/admin/config/sandbox', ['settings' => ['Zombies' => 1]])
+        ->assertStatus(409)
+        ->assertJsonStructure(['error']);
+});
+
 it('creates audit log for admin config updates', function () {
     mockAdminIniParser(['MaxPlayers' => '16']);
     mockAdminLuaParser();

@@ -1,14 +1,16 @@
 <?php
 
+use App\Services\ConfigStateManager;
 use App\Services\ModManager;
 use App\Services\ServerIniParser;
 
 beforeEach(function () {
     $this->parser = new ServerIniParser;
-    $this->manager = new ModManager($this->parser);
+    $this->manager = new ModManager($this->parser, new ConfigStateManager);
     $this->tempDir = sys_get_temp_dir().'/pz_test_'.uniqid();
     mkdir($this->tempDir.'/Server', 0777, true);
     $this->iniPath = $this->tempDir.'/Server/ZomboidServer.ini';
+    $this->configStatePath = $this->tempDir.'/.config_state';
     copy(dirname(__DIR__).'/fixtures/server.ini', $this->iniPath);
 });
 
@@ -18,6 +20,13 @@ afterEach(function () {
     }
     foreach (['.mod_state', '.mod_state_applied'] as $sidecar) {
         $path = $this->tempDir.'/Server/'.$sidecar;
+        if (file_exists($path)) {
+            unlink($path);
+        }
+    }
+    // .config_state (and its flock file) live one level above Server/.
+    foreach (['.config_state', '.config_state.lock'] as $sidecar) {
+        $path = $this->tempDir.'/'.$sidecar;
         if (file_exists($path)) {
             unlink($path);
         }
@@ -392,4 +401,87 @@ it('falls back to active when applied snapshot is missing on running server', fu
         ->and($result['applied_snapshot_present'])->toBeFalse()
         ->and(collect($result['mods'])->pluck('status')->all())
         ->each->toBe('active');
+});
+
+it('persists Map to .config_state when adding a map mod', function () {
+    $this->manager->add($this->iniPath, '9999999999', 'MapMod', 'CustomMap');
+
+    expect(file_exists($this->configStatePath))->toBeTrue();
+    expect(file_get_contents($this->configStatePath))->toContain('Map=')
+        ->and(file_get_contents($this->configStatePath))->toContain('CustomMap');
+});
+
+it('persists Map to .config_state when removing a map mod', function () {
+    $this->manager->add($this->iniPath, '9999999999', 'MapMod', 'CustomMap');
+    $this->manager->remove($this->iniPath, '9999999999', 'CustomMap');
+
+    expect(file_get_contents($this->configStatePath))->not->toContain('CustomMap');
+});
+
+it('does not touch .config_state when adding a mod without a map folder', function () {
+    $this->manager->add($this->iniPath, '1111111111', 'TestMod');
+
+    expect(file_exists($this->configStatePath))->toBeFalse();
+});
+
+it('bulk imports mods, merging into the existing list', function () {
+    $summary = $this->manager->bulkImport($this->iniPath, [
+        ['workshop_id' => '1111111111', 'mod_id' => 'ModA'],
+        ['workshop_id' => '2222222222', 'mod_id' => 'ModB'],
+    ]);
+
+    expect($summary['added'])->toBe(2)
+        ->and($summary['skipped'])->toBe(0);
+
+    $modIds = collect($this->manager->list($this->iniPath))->pluck('mod_id')->all();
+    expect($modIds)->toContain('SuperSurvivors', 'Hydrocraft', 'ModA', 'ModB', 'ZomboidManager');
+});
+
+it('bulk import skips workshop ids that are already installed', function () {
+    $summary = $this->manager->bulkImport($this->iniPath, [
+        ['workshop_id' => '2561774086', 'mod_id' => 'SuperSurvivors'],
+        ['workshop_id' => '3333333333', 'mod_id' => 'FreshMod'],
+    ]);
+
+    expect($summary['added'])->toBe(1)
+        ->and($summary['skipped'])->toBe(1);
+
+    $workshopIds = collect($this->manager->list($this->iniPath))->pluck('workshop_id')->all();
+    expect(array_count_values($workshopIds)['2561774086'])->toBe(1);
+});
+
+it('bulk import writes .mod_state and re-attaches ZomboidManager', function () {
+    $this->manager->bulkImport($this->iniPath, [
+        ['workshop_id' => '1111111111', 'mod_id' => 'ModA'],
+    ]);
+
+    $state = file_get_contents($this->tempDir.'/Server/.mod_state');
+    expect($state)->toContain('Mods=SuperSurvivors;Hydrocraft;ModA;ZomboidManager')
+        ->and($state)->toContain('WorkshopItems=2561774086;2286126274;1111111111;3685323705');
+});
+
+it('bulk import prepends new map folders before the vanilla map and persists them', function () {
+    $summary = $this->manager->bulkImport(
+        $this->iniPath,
+        [['workshop_id' => '1111111111', 'mod_id' => 'ModA']],
+        ['BigMap', 'Muldraugh, KY'],
+    );
+
+    expect($summary['maps_added'])->toBe(1);
+
+    // Mod maps must sit ahead of the vanilla base map in Map=.
+    expect($this->parser->read($this->iniPath)['Map'])->toBe('BigMap;Muldraugh, KY');
+    expect(file_get_contents($this->configStatePath))->toContain('Map=BigMap;Muldraugh, KY');
+});
+
+it('bulk import with only already-installed mods and no maps writes nothing new', function () {
+    unlink($this->tempDir.'/Server/.mod_state');
+
+    $summary = $this->manager->bulkImport($this->iniPath, [
+        ['workshop_id' => '2561774086', 'mod_id' => 'SuperSurvivors'],
+    ]);
+
+    expect($summary['added'])->toBe(0)
+        ->and($summary['skipped'])->toBe(1)
+        ->and(file_exists($this->tempDir.'/Server/.mod_state'))->toBeFalse();
 });
