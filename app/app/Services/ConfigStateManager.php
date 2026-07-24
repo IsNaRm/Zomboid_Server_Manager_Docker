@@ -131,8 +131,15 @@ class ConfigStateManager
         return $data;
     }
 
+    /**
+     * `.config_state` lives in the same `Server/` directory as the INI and
+     * `.mod_state`. That directory is the one the game-server container makes
+     * world-writable on the shared volume, so PHP-FPM (www-data) can write here;
+     * the data-root directory above it is owned by root and is not writable by
+     * the app, which is why `.config_state` must NOT live there.
+     */
     private function stateFilePath(string $iniPath): string
     {
-        return dirname($iniPath, 2).'/.config_state';
+        return dirname($iniPath).'/.config_state';
     }
 }

@@ -32,7 +32,6 @@ import { useTranslation } from '@/hooks/use-translation';
 import AppLayout from '@/layouts/app-layout';
 import { fetchAction } from '@/lib/fetch-action';
 import { parseModImport } from '@/lib/parse-mod-import';
-import type { ParsedModEntry } from '@/lib/parse-mod-import';
 import type { BreadcrumbItem, ModEntry } from '@/types';
 
 type LookupResult = {
@@ -196,13 +195,15 @@ export default function Mods({
     const lookupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const lookupAbort = useRef<AbortController | null>(null);
 
-    const existingIds = useMemo(() => new Set(mods.map((m) => m.workshop_id)), [mods]);
+    const existingWorkshopIds = useMemo(() => new Set(mods.map((m) => m.workshop_id).filter(Boolean)), [mods]);
+    const existingModIds = useMemo(() => new Set(mods.map((m) => m.mod_id).filter(Boolean)), [mods]);
 
     const [showBulk, setShowBulk] = useState(false);
     const [bulkText, setBulkText] = useState('');
     const [bulkPhase, setBulkPhase] = useState<'input' | 'resolving' | 'ready'>('input');
     const [bulkProgress, setBulkProgress] = useState({ done: 0, total: 0 });
-    const [bulkEntries, setBulkEntries] = useState<ParsedModEntry[]>([]);
+    const [bulkWorkshopIds, setBulkWorkshopIds] = useState<string[]>([]);
+    const [bulkModIds, setBulkModIds] = useState<string[]>([]);
     const [bulkMapFolders, setBulkMapFolders] = useState<string[]>([]);
     const [bulkUnresolved, setBulkUnresolved] = useState<string[]>([]);
     const [importing, setImporting] = useState(false);
@@ -210,15 +211,17 @@ export default function Mods({
 
     const isFiltering = search.length > 0;
 
-    const bulkNewCount = bulkEntries.filter((e) => !existingIds.has(e.workshop_id)).length;
-    const bulkAlreadyCount = bulkEntries.length - bulkNewCount;
+    const bulkNewMods = bulkModIds.filter((m) => !existingModIds.has(m)).length;
+    const bulkNewWorkshop = bulkWorkshopIds.filter((w) => !existingWorkshopIds.has(w)).length;
+    const bulkHasSomething = bulkModIds.length > 0 || bulkWorkshopIds.length > 0;
 
     function openBulk() {
         bulkCancelled.current = false;
         setBulkText('');
         setBulkPhase('input');
         setBulkProgress({ done: 0, total: 0 });
-        setBulkEntries([]);
+        setBulkWorkshopIds([]);
+        setBulkModIds([]);
         setBulkMapFolders([]);
         setBulkUnresolved([]);
         setShowBulk(true);
@@ -234,18 +237,22 @@ export default function Mods({
         setBulkMapFolders(parsed.mapFolders);
 
         if (parsed.mode === 'ini') {
-            setBulkEntries(parsed.entries);
-            setBulkUnresolved(parsed.unpaired);
+            setBulkWorkshopIds(parsed.workshopIds);
+            setBulkModIds(parsed.modIds);
+            setBulkUnresolved([]);
             setBulkPhase('ready');
             return;
         }
 
-        // IDs-only: resolve each mod_id via the Steam lookup endpoint, showing progress.
+        // IDs-only: resolve each Workshop ID's mod IDs via the Steam lookup endpoint.
+        // A single Workshop item can provide several mods, so collect them all.
         bulkCancelled.current = false;
         setBulkPhase('resolving');
         setBulkProgress({ done: 0, total: parsed.workshopIds.length });
 
-        const entries: ParsedModEntry[] = [];
+        const workshopIds: string[] = [];
+        const modIds: string[] = [];
+        const mapFolders: string[] = [...parsed.mapFolders];
         const unresolved: string[] = [];
 
         for (let i = 0; i < parsed.workshopIds.length; i++) {
@@ -258,9 +265,13 @@ export default function Mods({
                 silent: true,
             })) as { found?: boolean; mod_ids?: string[]; map_folders?: string[] } | null;
 
-            const modIds = json?.mod_ids ?? [];
-            if (json && json.found !== false && modIds.length > 0) {
-                entries.push({ workshop_id: id, mod_id: modIds[0], map_folder: json.map_folders?.[0] });
+            const ids = json?.mod_ids ?? [];
+            if (json && json.found !== false && ids.length > 0) {
+                workshopIds.push(id);
+                modIds.push(...ids);
+                if (json.map_folders) {
+                    mapFolders.push(...json.map_folders);
+                }
             } else {
                 unresolved.push(id);
             }
@@ -270,7 +281,9 @@ export default function Mods({
         if (bulkCancelled.current) {
             return;
         }
-        setBulkEntries(entries);
+        setBulkWorkshopIds(workshopIds);
+        setBulkModIds(modIds);
+        setBulkMapFolders(mapFolders);
         setBulkUnresolved(unresolved);
         setBulkPhase('ready');
     }
@@ -279,14 +292,13 @@ export default function Mods({
         setImporting(true);
         const result = await fetchAction('/admin/mods/import', {
             data: {
-                mods: bulkEntries.map((e) => ({
-                    workshop_id: e.workshop_id,
-                    mod_id: e.mod_id,
-                    map_folder: e.map_folder ?? null,
-                })),
+                workshop_ids: bulkWorkshopIds,
+                mod_ids: bulkModIds,
                 map: bulkMapFolders,
             },
-            successMessage: t('admin.mods.bulk_toast_imported', { count: String(bulkEntries.length) }),
+            successMessage: t('admin.mods.bulk_toast_imported', {
+                count: String(bulkModIds.length || bulkWorkshopIds.length),
+            }),
         });
         setImporting(false);
         if (result) {
@@ -751,13 +763,13 @@ export default function Mods({
                     {bulkPhase === 'ready' && (
                         <div className="space-y-3">
                             <div className="grid grid-cols-3 gap-2 text-center">
-                                <div className="rounded-md border p-2" data-testid="bulk-new-count">
-                                    <div className="text-lg font-semibold text-emerald-600">{bulkNewCount}</div>
-                                    <div className="text-xs text-muted-foreground">{t('admin.mods.bulk_new')}</div>
+                                <div className="rounded-md border p-2" data-testid="bulk-new-mods">
+                                    <div className="text-lg font-semibold text-emerald-600">{bulkNewMods}</div>
+                                    <div className="text-xs text-muted-foreground">{t('admin.mods.bulk_new_mods')}</div>
                                 </div>
                                 <div className="rounded-md border p-2">
-                                    <div className="text-lg font-semibold">{bulkAlreadyCount}</div>
-                                    <div className="text-xs text-muted-foreground">{t('admin.mods.bulk_already')}</div>
+                                    <div className="text-lg font-semibold">{bulkNewWorkshop}</div>
+                                    <div className="text-xs text-muted-foreground">{t('admin.mods.bulk_new_workshop')}</div>
                                 </div>
                                 <div className="rounded-md border p-2">
                                     <div className="text-lg font-semibold text-amber-600">{bulkUnresolved.length}</div>
@@ -780,7 +792,7 @@ export default function Mods({
                                     </AlertDescription>
                                 </Alert>
                             )}
-                            {bulkEntries.length === 0 && (
+                            {!bulkHasSomething && (
                                 <p className="text-sm text-muted-foreground">{t('admin.mods.bulk_nothing')}</p>
                             )}
                         </div>
@@ -812,13 +824,15 @@ export default function Mods({
                                     {t('admin.mods.bulk_back')}
                                 </Button>
                                 <Button
-                                    disabled={importing || bulkEntries.length === 0}
+                                    disabled={importing || !bulkHasSomething}
                                     onClick={submitBulk}
                                     data-testid="bulk-import-submit"
                                 >
                                     {importing
                                         ? t('admin.mods.bulk_importing')
-                                        : t('admin.mods.bulk_do_import', { count: String(bulkEntries.length) })}
+                                        : t('admin.mods.bulk_do_import', {
+                                              count: String(bulkModIds.length || bulkWorkshopIds.length),
+                                          })}
                                 </Button>
                             </>
                         )}

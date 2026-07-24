@@ -202,19 +202,15 @@ class ModController extends Controller
      */
     public function import(ImportModsRequest $request): JsonResponse
     {
-        $mods = $request->validated('mods');
+        $workshopIds = $request->validated('workshop_ids', []);
+        $modIds = $request->validated('mod_ids', []);
         $mapFolders = $request->validated('map', []);
-
-        foreach ($mods as $mod) {
-            if (! empty($mod['map_folder'])) {
-                $mapFolders[] = $mod['map_folder'];
-            }
-        }
 
         try {
             $summary = $this->modManager->bulkImport(
                 config('zomboid.paths.server_ini'),
-                $mods,
+                $workshopIds,
+                $modIds,
                 $mapFolders,
             );
         } catch (RuntimeException $e) {

@@ -21,7 +21,7 @@ beforeEach(function () {
     $this->luaPath = $this->tempDir.'/Server/ZomboidServer_SandboxVars.lua';
     copy(base_path('tests/fixtures/server.ini'), $this->iniPath);
     copy(base_path('tests/fixtures/sandbox.lua'), $this->luaPath);
-    $this->stateFile = $this->tempDir.'/.config_state';
+    $this->stateFile = $this->tempDir.'/Server/.config_state';
 
     config(['zomboid.paths.server_ini' => $this->iniPath]);
     config(['zomboid.paths.sandbox_lua' => $this->luaPath]);
@@ -31,7 +31,7 @@ afterEach(function () {
     @unlink($this->iniPath);
     @unlink($this->luaPath);
     @unlink($this->stateFile);
-    foreach (glob($this->tempDir.'/.config_state.*') as $f) {
+    foreach (glob($this->tempDir.'/Server/.config_state.*') as $f) {
         @unlink($f);
     }
     @rmdir($this->tempDir.'/Server');

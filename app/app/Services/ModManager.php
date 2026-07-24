@@ -264,53 +264,35 @@ class ModManager
     }
 
     /**
-     * Merge a batch of mods into the current lists in one write.
+     * Merge a pasted modpack into the current config in one write.
      *
-     * Appends every entry whose Workshop ID isn't already installed (preserving
-     * the incoming order) and leaves existing mods untouched — never removes. Any
-     * `$mapFolders` not already present are prepended to the `Map=` line so modded
-     * maps sit ahead of the vanilla base map (PZ resolves overlapping cells in list
-     * order, vanilla last). Everything is written through `writeIniAndState`, so the
-     * merged list lands in `.mod_state` (authoritative across reboots), ZomboidManager
-     * is re-attached, and any Map change is persisted to `.config_state`.
+     * PZ treats `Mods=`, `WorkshopItems=`, and `Map=` as three INDEPENDENT ordered
+     * lists — a single Workshop item can provide several mod IDs, and some mods have
+     * no Workshop ID at all, so the counts routinely differ (a 122-item pack can have
+     * 265 mods). Each list is therefore merged on its own: new entries are appended in
+     * the order given, existing ones are left untouched (never removed), and duplicates
+     * are skipped. Map folders are prepended so modded maps sit ahead of the vanilla
+     * base map (PZ resolves overlapping cells in list order, vanilla last).
      *
-     * @param  array<int, array{workshop_id: string, mod_id: string}>  $entries
+     * Everything is written through `writeIniAndState`, so the merged lists land in
+     * `.mod_state` (authoritative across reboots), ZomboidManager is re-attached, and
+     * any Map change is persisted to `.config_state`.
+     *
+     * @param  list<string>  $workshopIds
+     * @param  list<string>  $modIds
      * @param  list<string>  $mapFolders
-     * @return array{added: int, skipped: int, maps_added: int, total: int}
+     * @return array{workshop_added: int, mods_added: int, maps_added: int}
      */
-    public function bulkImport(string $iniPath, array $entries, array $mapFolders = []): array
+    public function bulkImport(string $iniPath, array $workshopIds, array $modIds, array $mapFolders = []): array
     {
         $current = $this->readCurrentLists($iniPath);
-        $workshopIds = $current['workshop_ids'];
-        $modIds = $current['mod_ids'];
 
-        $existing = array_flip($workshopIds);
-        $added = [];
-        $skipped = 0;
-
-        foreach ($entries as $entry) {
-            $workshopId = trim((string) ($entry['workshop_id'] ?? ''));
-            $modId = trim((string) ($entry['mod_id'] ?? ''));
-
-            if ($workshopId === '' || $modId === '') {
-                continue;
-            }
-
-            if (isset($existing[$workshopId])) {
-                $skipped++;
-
-                continue;
-            }
-
-            $workshopIds[] = $workshopId;
-            $modIds[] = $modId;
-            $existing[$workshopId] = true;
-            $added[] = $workshopId;
-        }
+        [$mergedWorkshop, $workshopAdded] = $this->mergeList($current['workshop_ids'], $workshopIds);
+        [$mergedMods, $modsAdded] = $this->mergeList($current['mod_ids'], $modIds);
 
         $updates = [
-            'WorkshopItems' => implode(';', $workshopIds),
-            'Mods' => implode(';', $modIds),
+            'WorkshopItems' => implode(';', $mergedWorkshop),
+            'Mods' => implode(';', $mergedMods),
         ];
 
         $newMapFolders = [];
@@ -333,23 +315,42 @@ class ModManager
             }
         }
 
-        if ($added === [] && $newMapFolders === []) {
-            return [
-                'added' => 0,
-                'skipped' => $skipped,
-                'maps_added' => 0,
-                'total' => count($workshopIds),
-            ];
+        if ($workshopAdded === 0 && $modsAdded === 0 && $newMapFolders === []) {
+            return ['workshop_added' => 0, 'mods_added' => 0, 'maps_added' => 0];
         }
 
         $this->writeIniAndState($iniPath, $updates);
 
         return [
-            'added' => count($added),
-            'skipped' => $skipped,
+            'workshop_added' => $workshopAdded,
+            'mods_added' => $modsAdded,
             'maps_added' => count($newMapFolders),
-            'total' => count($workshopIds),
         ];
+    }
+
+    /**
+     * Append trimmed, non-empty, not-yet-present items to $current, preserving order.
+     *
+     * @param  list<string>  $current
+     * @param  list<string>  $incoming
+     * @return array{0: list<string>, 1: int}  The merged list and the number added.
+     */
+    private function mergeList(array $current, array $incoming): array
+    {
+        $seen = array_flip($current);
+        $added = 0;
+
+        foreach ($incoming as $item) {
+            $item = trim((string) $item);
+            if ($item === '' || isset($seen[$item])) {
+                continue;
+            }
+            $seen[$item] = true;
+            $current[] = $item;
+            $added++;
+        }
+
+        return [$current, $added];
     }
 
     /**

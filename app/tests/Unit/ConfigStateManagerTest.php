@@ -8,7 +8,7 @@ beforeEach(function () {
     mkdir($this->tempDir.'/Server', 0777, true);
     $this->iniPath = $this->tempDir.'/Server/ZomboidServer.ini';
     file_put_contents($this->iniPath, "DefaultPort=16261\nMaxPlayers=16\n");
-    $this->stateFile = $this->tempDir.'/.config_state';
+    $this->stateFile = $this->tempDir.'/Server/.config_state';
 });
 
 afterEach(function () {
@@ -16,7 +16,7 @@ afterEach(function () {
     @unlink($this->stateFile);
     @unlink($this->stateFile.'.lock');
     // Clean up temp files left by atomic writes
-    foreach (glob($this->tempDir.'/.config_state.*') as $f) {
+    foreach (glob($this->tempDir.'/Server/.config_state.*') as $f) {
         @unlink($f);
     }
     @rmdir($this->tempDir.'/Server');

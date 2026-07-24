@@ -20,51 +20,56 @@ afterEach(function () {
     @unlink($this->tempDir.'/Server/.mod_state');
     @unlink($this->tempDir.'/Server/.mod_state_applied');
     @unlink($this->iniPath);
-    @unlink($this->tempDir.'/.config_state');
-    @unlink($this->tempDir.'/.config_state.lock');
+    @unlink($this->tempDir.'/Server/.config_state');
+    @unlink($this->tempDir.'/Server/.config_state.lock');
     @rmdir($this->tempDir.'/Server');
     @rmdir($this->tempDir);
 });
 
-it('bulk imports mods, merging into the existing list', function () {
+it('bulk imports independent mod and workshop lists, merging into existing', function () {
     $response = $this->actingAs($this->admin)->postJson('/admin/mods/import', [
-        'mods' => [
-            ['workshop_id' => '1111111111', 'mod_id' => 'ModA'],
-            ['workshop_id' => '2222222222', 'mod_id' => 'ModB'],
-        ],
+        'workshop_ids' => ['1111111111', '2222222222'],
+        'mod_ids' => ['ModA', 'ModB', 'ModC'],
     ]);
 
     $response->assertCreated()
-        ->assertJson(['restart_required' => true, 'summary' => ['added' => 2, 'skipped' => 0]]);
+        ->assertJson(['restart_required' => true, 'summary' => ['workshop_added' => 2, 'mods_added' => 3]]);
 
     $modIds = collect($response->json('mods'))->pluck('mod_id')->all();
-    expect($modIds)->toContain('SuperSurvivors', 'Hydrocraft', 'ModA', 'ModB', 'ZomboidManager');
+    expect($modIds)->toContain('SuperSurvivors', 'Hydrocraft', 'ModA', 'ModB', 'ModC', 'ZomboidManager');
 });
 
-it('skips already-installed mods on import', function () {
+it('skips already-installed entries on import', function () {
     $this->actingAs($this->admin)->postJson('/admin/mods/import', [
-        'mods' => [
-            ['workshop_id' => '2561774086', 'mod_id' => 'SuperSurvivors'],
-            ['workshop_id' => '3333333333', 'mod_id' => 'Fresh'],
-        ],
+        'workshop_ids' => ['2561774086', '3333333333'],
+        'mod_ids' => ['SuperSurvivors', 'Fresh'],
     ])
         ->assertCreated()
-        ->assertJson(['summary' => ['added' => 1, 'skipped' => 1]]);
+        ->assertJson(['summary' => ['workshop_added' => 1, 'mods_added' => 1]]);
+});
+
+it('accepts real B42 mod IDs with brackets, ampersands and slashes', function () {
+    $this->actingAs($this->admin)->postJson('/admin/mods/import', [
+        'mod_ids' => ['[B42] Tatrapan', 'FWOBenchPress&Treadmill', '1299328280/ToadTraits'],
+    ])->assertCreated();
+
+    $mods = (new ServerIniParser)->read($this->iniPath)['Mods'];
+    expect($mods)->toContain('[B42] Tatrapan', 'FWOBenchPress&Treadmill', '1299328280/ToadTraits');
 });
 
 it('merges a pasted Map line and persists it to .config_state', function () {
     $this->actingAs($this->admin)->postJson('/admin/mods/import', [
-        'mods' => [['workshop_id' => '1111111111', 'mod_id' => 'BigMapMod']],
+        'mod_ids' => ['BigMapMod'],
         'map' => ['BigMap', 'Muldraugh, KY'],
     ])->assertCreated();
 
     expect((new ServerIniParser)->read($this->iniPath)['Map'])->toBe('BigMap;Muldraugh, KY')
-        ->and(file_get_contents($this->tempDir.'/.config_state'))->toContain('Map=BigMap;Muldraugh, KY');
+        ->and(file_get_contents($this->tempDir.'/Server/.config_state'))->toContain('Map=BigMap;Muldraugh, KY');
 });
 
 it('writes an audit log for the import', function () {
     $this->actingAs($this->admin)->postJson('/admin/mods/import', [
-        'mods' => [['workshop_id' => '1111111111', 'mod_id' => 'ModA']],
+        'mod_ids' => ['ModA'],
     ])->assertCreated();
 
     $log = AuditLog::query()->where('action', 'mod.import')->first();
@@ -76,22 +81,34 @@ it('writes an audit log for the import', function () {
 
 it('rejects the import for guests', function () {
     $this->postJson('/admin/mods/import', [
-        'mods' => [['workshop_id' => '1111111111', 'mod_id' => 'ModA']],
+        'mod_ids' => ['ModA'],
     ])->assertUnauthorized();
+});
+
+it('rejects a payload with nothing to import', function () {
+    $this->actingAs($this->admin)->postJson('/admin/mods/import', [
+        'map' => ['SomeMap'],
+    ])->assertUnprocessable();
 });
 
 it('rejects an invalid workshop id', function () {
     $this->actingAs($this->admin)->postJson('/admin/mods/import', [
-        'mods' => [['workshop_id' => 'not-a-number', 'mod_id' => 'ModA']],
+        'workshop_ids' => ['not-a-number'],
+    ])->assertUnprocessable();
+});
+
+it('rejects a mod id containing the list separator', function () {
+    $this->actingAs($this->admin)->postJson('/admin/mods/import', [
+        'mod_ids' => ['Evil;Injected'],
     ])->assertUnprocessable();
 });
 
 it('rejects a batch larger than the cap', function () {
-    $mods = [];
-    for ($i = 0; $i < 601; $i++) {
-        $mods[] = ['workshop_id' => (string) (1000000000 + $i), 'mod_id' => 'Mod'.$i];
+    $modIds = [];
+    for ($i = 0; $i < 1001; $i++) {
+        $modIds[] = 'Mod'.$i;
     }
 
-    $this->actingAs($this->admin)->postJson('/admin/mods/import', ['mods' => $mods])
+    $this->actingAs($this->admin)->postJson('/admin/mods/import', ['mod_ids' => $modIds])
         ->assertUnprocessable();
 });

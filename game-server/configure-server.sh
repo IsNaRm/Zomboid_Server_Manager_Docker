@@ -57,7 +57,19 @@ echo "[configure-server] Applying configuration..."
 
 # Web UI persistence file — written by Laravel when config is saved via dashboard/API.
 # Values here take priority over env var defaults so web UI changes survive restarts.
-CONFIG_STATE_FILE="${PZ_CONFIG_DIR}/.config_state"
+#
+# Lives in Server/ (next to the INI and .mod_state) because that is the directory
+# the app container (www-data) can write on the shared volume; the data root above
+# is root-owned and not app-writable. Older builds wrote it to the data root, so
+# migrate that file into Server/ once if it's still there.
+CONFIG_STATE_FILE="${INI_DIR}/.config_state"
+LEGACY_CONFIG_STATE_FILE="${PZ_CONFIG_DIR}/.config_state"
+if [ ! -f "$CONFIG_STATE_FILE" ] && [ -f "$LEGACY_CONFIG_STATE_FILE" ]; then
+    if mv "$LEGACY_CONFIG_STATE_FILE" "$CONFIG_STATE_FILE" 2>/dev/null; then
+        chmod 666 "$CONFIG_STATE_FILE" 2>/dev/null || true
+        echo "[configure-server] Migrated .config_state into Server/"
+    fi
+fi
 
 # Read a value from .config_state, or return empty string.
 read_config_state() {
